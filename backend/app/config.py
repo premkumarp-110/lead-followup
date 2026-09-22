@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     # Default false: "only if the variable in the env is specified".
     call_analyzer_enabled: bool = Field(False, alias="CALL_ANALYZER_ENABLED")
 
+    # Each "Analyze New Call" input mode can be independently shown/hidden.
+    # Default true for all three so existing setups keep working unchanged;
+    # set any to false to hide that tab from the UI and reject its endpoint.
+    call_analyzer_upload_enabled: bool = Field(True, alias="CALL_ANALYZER_UPLOAD_ENABLED")
+    call_analyzer_url_enabled: bool = Field(True, alias="CALL_ANALYZER_URL_ENABLED")
+    call_analyzer_text_enabled: bool = Field(True, alias="CALL_ANALYZER_TEXT_ENABLED")
+
     # ---- Pipeline ----------------------------------------------------------
     transcription_provider: str = Field("vertex", alias="TRANSCRIPTION_PROVIDER")
     # When Gemini fails, fall back to the deterministic keyword analyzer so the

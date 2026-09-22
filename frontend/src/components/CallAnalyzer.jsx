@@ -58,9 +58,23 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
   const caller = useMemo(() => callers.find((c) => c.caller_id === callerId), [callers, callerId])
   const allowed = config?.allowed_audio_types || ['mp3', 'wav', 'm4a', 'ogg', 'webm']
   const maxMb = config?.max_audio_mb || 20
-  const uploadDisabled = config?.audio_storage_mode === 'url'
 
-  useEffect(() => { if (uploadDisabled) setMode('url') }, [uploadDisabled])
+  // Each tab is independently shown/hidden by its own env flag. Upload is
+  // additionally off when there's nowhere local to store the file. Default
+  // to enabled while config hasn't loaded yet, so tabs don't flash away.
+  const uploadEnabled = (config?.call_analyzer_upload_enabled ?? true) && config?.audio_storage_mode !== 'url'
+  const urlEnabled = config?.call_analyzer_url_enabled ?? true
+  const textEnabled = config?.call_analyzer_text_enabled ?? true
+  const modeEnabled = { upload: uploadEnabled, url: urlEnabled, text: textEnabled }
+  const noModesEnabled = !uploadEnabled && !urlEnabled && !textEnabled
+
+  // If the current tab becomes hidden (config loaded, or an env flag
+  // changed), fall back to the first tab that's still enabled.
+  useEffect(() => {
+    if (modeEnabled[mode]) return
+    const next = ['upload', 'url', 'text'].find((m) => modeEnabled[m])
+    if (next) setMode(next)
+  }, [uploadEnabled, urlEnabled, textEnabled])
 
   // ---- file handling -------------------------------------------------------
 
@@ -220,34 +234,44 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
         {/* ---------------- Audio input ---------------- */}
         <div className="panel">
           <div className="segmented" role="tablist">
-            <button
-              type="button" role="tab" aria-selected={mode === 'upload'}
-              className={mode === 'upload' ? 'active' : ''}
-              onClick={() => { setMode('upload'); resetOutcome() }}
-              disabled={busy || uploadDisabled}
-              title={uploadDisabled ? 'Uploads are disabled (AUDIO_STORAGE_MODE=url)' : undefined}
-            >
-              Upload Audio
-            </button>
-            <button
-              type="button" role="tab" aria-selected={mode === 'url'}
-              className={mode === 'url' ? 'active' : ''}
-              onClick={() => { setMode('url'); resetOutcome() }}
-              disabled={busy}
-            >
-              Audio URL
-            </button>
-            <button
-              type="button" role="tab" aria-selected={mode === 'text'}
-              className={mode === 'text' ? 'active' : ''}
-              onClick={() => { setMode('text'); resetOutcome() }}
-              disabled={busy}
-            >
-              Paste Transcript
-            </button>
+            {uploadEnabled && (
+              <button
+                type="button" role="tab" aria-selected={mode === 'upload'}
+                className={mode === 'upload' ? 'active' : ''}
+                onClick={() => { setMode('upload'); resetOutcome() }}
+                disabled={busy}
+              >
+                Upload Audio
+              </button>
+            )}
+            {urlEnabled && (
+              <button
+                type="button" role="tab" aria-selected={mode === 'url'}
+                className={mode === 'url' ? 'active' : ''}
+                onClick={() => { setMode('url'); resetOutcome() }}
+                disabled={busy}
+              >
+                Audio URL
+              </button>
+            )}
+            {textEnabled && (
+              <button
+                type="button" role="tab" aria-selected={mode === 'text'}
+                className={mode === 'text' ? 'active' : ''}
+                onClick={() => { setMode('text'); resetOutcome() }}
+                disabled={busy}
+              >
+                Paste Transcript
+              </button>
+            )}
           </div>
 
-          {mode === 'upload' ? (
+          {noModesEnabled ? (
+            <div className="form-error">
+              No call input mode is enabled. Set at least one of CALL_ANALYZER_UPLOAD_ENABLED,
+              CALL_ANALYZER_URL_ENABLED or CALL_ANALYZER_TEXT_ENABLED to true in backend/.env.
+            </div>
+          ) : mode === 'upload' ? (
             <div className="audio-input">
               {!file ? (
                 <label className={`dropzone ${busy ? 'disabled' : ''}`}>

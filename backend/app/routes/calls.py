@@ -57,6 +57,19 @@ def _require_analyzer_enabled() -> None:
         )
 
 
+def _require_mode_enabled(enabled: bool, env_var: str) -> None:
+    """Guard for one ingestion input mode (upload / URL / text).
+
+    Independent of `_require_analyzer_enabled` -- the feature as a whole can
+    be on while one specific input mode is turned off.
+    """
+    if not enabled:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This input mode is disabled ({env_var} is not set to true in backend/.env).",
+        )
+
+
 def _get_call_or_404(db: Database, call_id: str) -> dict:
     call = db[CALLS].find_one({"call_id": call_id})
     if call is None:
@@ -128,6 +141,7 @@ def upload_call(
 ) -> dict:
     """Accept an uploaded recording, store it, and create the call record."""
     _require_analyzer_enabled()
+    _require_mode_enabled(settings.call_analyzer_upload_enabled, "CALL_ANALYZER_UPLOAD_ENABLED")
     _require_lead_and_caller(db, lead_id, caller_id)
     if settings.audio_storage_mode != "local":
         raise HTTPException(
@@ -151,6 +165,7 @@ def upload_call(
 def validate_url(request: ValidateUrlRequest) -> dict:
     """Confirm a URL is public, reachable and looks like audio -- without downloading it."""
     _require_analyzer_enabled()
+    _require_mode_enabled(settings.call_analyzer_url_enabled, "CALL_ANALYZER_URL_ENABLED")
     try:
         return audio_service.validate_audio_url(request.audio_url)
     except AudioValidationError as exc:
@@ -161,6 +176,7 @@ def validate_url(request: ValidateUrlRequest) -> dict:
 def create_call_from_url(request: CallFromUrlRequest, db: Database = Depends(get_db)) -> dict:
     """Create a call record that references a remote recording."""
     _require_analyzer_enabled()
+    _require_mode_enabled(settings.call_analyzer_url_enabled, "CALL_ANALYZER_URL_ENABLED")
     _require_lead_and_caller(db, request.lead_id, request.caller_id)
     try:
         meta = audio_service.validate_audio_url(request.audio_url)
@@ -182,6 +198,7 @@ def create_call_from_text(request: CallFromTextRequest, db: Database = Depends(g
     so /process's existing transcript-reuse check skips straight to analysis.
     """
     _require_analyzer_enabled()
+    _require_mode_enabled(settings.call_analyzer_text_enabled, "CALL_ANALYZER_TEXT_ENABLED")
     _require_lead_and_caller(db, request.lead_id, request.caller_id)
 
     source = audio_service.AudioSource(

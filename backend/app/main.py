@@ -135,6 +135,9 @@ def ui_config() -> dict:
     """Non-secret settings for the frontend. No credentials, ever."""
     return {
         "call_analyzer_enabled": settings.call_analyzer_enabled,
+        "call_analyzer_upload_enabled": settings.call_analyzer_upload_enabled,
+        "call_analyzer_url_enabled": settings.call_analyzer_url_enabled,
+        "call_analyzer_text_enabled": settings.call_analyzer_text_enabled,
         "audio_storage_mode": settings.audio_storage_mode,
         "audio_playback_enabled": settings.audio_playback_enabled,
         "max_audio_mb": settings.max_audio_mb,

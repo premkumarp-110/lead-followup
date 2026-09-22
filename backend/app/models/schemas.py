@@ -71,6 +71,9 @@ class UIConfig(BaseModel):
     """Non-secret settings the frontend needs. Nothing here is a credential."""
 
     call_analyzer_enabled: bool
+    call_analyzer_upload_enabled: bool
+    call_analyzer_url_enabled: bool
+    call_analyzer_text_enabled: bool
     audio_storage_mode: str
     audio_playback_enabled: bool
     max_audio_mb: int
