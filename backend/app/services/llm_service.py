@@ -1,16 +1,18 @@
-"""Conversation analysis with Vertex AI Gemini -- THE LLM SWAP POINT.
+"""Conversation analysis via an OpenAI-compatible chat-completions endpoint --
+THE LLM SWAP POINT.
 
     analyze_conversation(transcript, lead_data, caller_data, call_ended_at) -> AnalysisRun
 
 This is the only module that knows how to talk to a language model about a
-sales conversation. Replacing Gemini with another model means changing this
-file; the models, follow-up logic, routes and dashboard stay as they are.
+sales conversation. Replacing the model means changing this file; the models,
+follow-up logic, routes and dashboard stay as they are. Transcription is a
+separate call (transcription_service.py) and is unaffected by this module.
 
 Flow for one call:
-  1. One Gemini request with a structured system prompt, JSON-only output.
+  1. One chat-completions request with a structured system prompt, JSON-only output.
   2. Validate the JSON with `CallAnalysisResult` (spec S13). Never trust raw output.
   3. If parsing/validation fails, ONE repair retry that quotes the error back.
-  4. If Gemini is unavailable or still invalid, and ANALYSIS_FALLBACK_ENABLED,
+  4. If the endpoint is unavailable or still invalid, and ANALYSIS_FALLBACK_ENABLED,
      run the deterministic keyword analyzer instead, flagged `degraded`.
 
 Every attempt -- failed or not -- is returned so the orchestrator can persist
@@ -28,7 +30,7 @@ from pydantic import ValidationError
 from app.config import settings
 from app.models.analysis import NO_DATE_REASON, CallAnalysisResult
 from app.services import call_analyzer
-from app.services.vertex_client import VertexUnavailable, describe_api_error, get_client
+from app.services.analysis_llm_client import AnalysisLLMUnavailable, call_chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,7 @@ IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 
 
 class LLMAnalysisError(RuntimeError):
-    """Gemini could not produce a valid analysis and no fallback was allowed."""
+    """The analysis LLM could not produce a valid analysis and no fallback was allowed."""
 
 
 @dataclass
@@ -122,31 +124,6 @@ Return ONLY a JSON object -- no prose, no markdown fences -- in exactly this sha
   "confidence": 0.0 to 1.0
 }}"""
 
-# A JSON schema handed to Gemini so it constrains its own output. Validation
-# still happens in Pydantic afterwards -- this just raises the hit rate.
-RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "outcome": {"type": "STRING", "enum": ["FOLLOW_UP_REQUIRED", "CONVERTED", "DROPPED"]},
-        "follow_up_required": {"type": "BOOLEAN"},
-        "follow_up": {
-            "type": "OBJECT",
-            "nullable": True,
-            "properties": {
-                "date": {"type": "STRING", "nullable": True},
-                "time": {"type": "STRING", "nullable": True},
-                "datetime": {"type": "STRING", "nullable": True},
-                "reason": {"type": "STRING", "nullable": True},
-            },
-        },
-        "customer_intent": {"type": "STRING"},
-        "summary": {"type": "STRING"},
-        "key_points": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "confidence": {"type": "NUMBER"},
-    },
-    "required": ["outcome", "follow_up_required", "customer_intent", "summary", "key_points", "confidence"],
-}
-
 
 def build_user_prompt(
     transcript: str, lead_data: dict, caller_data: dict | None, call_ended_at: datetime
@@ -203,52 +180,34 @@ def _format_validation_error(exc: Exception) -> str:
 
 
 # --------------------------------------------------------------------------
-# Gemini call
+# Analysis LLM call
 # --------------------------------------------------------------------------
 
 
-def _call_gemini(client, contents: list) -> str:
-    from google.genai import types
-
-    response = client.models.generate_content(
-        model=settings.vertex_ai_model,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.1,
-            response_mime_type="application/json",
-            response_schema=RESPONSE_SCHEMA,
-            max_output_tokens=2048,
-        ),
-    )
-    return (response.text or "").strip()
+def _call_analysis_llm(prompt_text: str) -> str:
+    return call_chat_completion(SYSTEM_PROMPT, prompt_text)
 
 
-def analyze_with_gemini(
+def analyze_with_llm(
     transcript: str, lead_data: dict, caller_data: dict | None, call_ended_at: datetime
 ) -> AnalysisAttempt:
-    """One Gemini analysis with a single repair retry on invalid output."""
-    model_name = settings.vertex_ai_model
-    try:
-        client = get_client()
-    except VertexUnavailable as exc:
-        return AnalysisAttempt(model=model_name, result=None, raw_response=None, error=str(exc))
-
+    """One analysis-LLM call with a single repair retry on invalid output."""
+    model_name = settings.call_analysis_model
     user_prompt = build_user_prompt(transcript, lead_data, caller_data, call_ended_at)
     raw = None
     try:
-        raw = _call_gemini(client, [user_prompt])
+        raw = _call_analysis_llm(user_prompt)
         result = parse_and_validate(raw)
         return AnalysisAttempt(model=model_name, result=result, raw_response=raw, error=None)
     except (ValueError, ValidationError) as first_error:
-        logger.warning("Gemini output failed validation; retrying once: %s", first_error)
+        logger.warning("Analysis LLM output failed validation; retrying once: %s", first_error)
         repair = (
             f"{user_prompt}\n\nYour previous response was rejected: "
             f"{_format_validation_error(first_error)}\nPrevious response:\n{raw}\n\n"
             "Return a corrected JSON object only."
         )
         try:
-            raw2 = _call_gemini(client, [repair])
+            raw2 = _call_analysis_llm(repair)
             result = parse_and_validate(raw2)
             return AnalysisAttempt(model=model_name, result=result, raw_response=raw2, error=None)
         except (ValueError, ValidationError) as second_error:
@@ -258,13 +217,19 @@ def analyze_with_gemini(
                 raw_response=f"--- attempt 1 ---\n{raw}\n--- attempt 2 ---\n{locals().get('raw2', '')}",
                 error=_format_validation_error(second_error),
             )
+        except AnalysisLLMUnavailable as exc:
+            return AnalysisAttempt(model=model_name, result=None, raw_response=raw, error=str(exc))
         except Exception as exc:
             return AnalysisAttempt(
-                model=model_name, result=None, raw_response=raw, error=describe_api_error(exc)
+                model=model_name, result=None, raw_response=raw,
+                error=f"Unexpected analysis error: {exc.__class__.__name__}: {exc}",
             )
-    except Exception as exc:  # APIError, network, auth
+    except AnalysisLLMUnavailable as exc:  # not configured, network, HTTP, bad response shape
+        return AnalysisAttempt(model=model_name, result=None, raw_response=raw, error=str(exc))
+    except Exception as exc:  # defensive backstop -- a bug here must not crash process_call()
         return AnalysisAttempt(
-            model=model_name, result=None, raw_response=raw, error=describe_api_error(exc)
+            model=model_name, result=None, raw_response=raw,
+            error=f"Unexpected analysis error: {exc.__class__.__name__}: {exc}",
         )
 
 
@@ -280,7 +245,7 @@ def analyze_conversation(
     *,
     call_ended_at: datetime | None = None,
 ) -> AnalysisRun:
-    """Analyse a transcript. Gemini first; keyword fallback only if Gemini fails.
+    """Analyse a transcript. The analysis LLM first; keyword fallback only if it fails.
 
     Raises LLMAnalysisError when nothing produced a valid result.
     """
@@ -289,14 +254,14 @@ def analyze_conversation(
         ended = ended.replace(tzinfo=timezone.utc)
 
     run = AnalysisRun()
-    gemini = analyze_with_gemini(transcript, lead_data, caller_data, ended)
-    run.attempts.append(gemini)
-    if gemini.succeeded:
+    attempt = analyze_with_llm(transcript, lead_data, caller_data, ended)
+    run.attempts.append(attempt)
+    if attempt.succeeded:
         return run
 
-    logger.warning("Gemini analysis failed: %s", gemini.error)
+    logger.warning("Analysis LLM failed: %s", attempt.error)
     if not settings.analysis_fallback_enabled:
-        raise LLMAnalysisError(gemini.error or "Gemini analysis failed.")
+        raise LLMAnalysisError(attempt.error or "Analysis LLM failed.")
 
     fallback = call_analyzer.analyze_call(transcript, call_ended_at=ended)
     run.attempts.append(

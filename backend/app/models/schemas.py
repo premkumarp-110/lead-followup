@@ -107,6 +107,20 @@ class CallFromUrlRequest(BaseModel):
     caller_id: str
 
 
+class CallFromTextRequest(BaseModel):
+    transcript: str
+    lead_id: str
+    caller_id: str
+
+    @field_validator("transcript")
+    @classmethod
+    def _transcript_required(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise ValueError("A transcript is required.")
+        return cleaned
+
+
 class ValidateUrlRequest(BaseModel):
     audio_url: str
 

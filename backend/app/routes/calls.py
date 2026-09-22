@@ -18,6 +18,7 @@ from app.models.analysis import CallAnalysis
 from app.models.call import Call, CallStatus, CallTranscript, SourceType
 from app.models.schemas import (
     CallCreatedResponse,
+    CallFromTextRequest,
     CallFromUrlRequest,
     CallStatusResponse,
     ProcessCallResponse,
@@ -170,6 +171,45 @@ def create_call_from_url(request: CallFromUrlRequest, db: Database = Depends(get
     call = _new_call_doc(request.lead_id, request.caller_id, source)
     db[CALLS].insert_one(call)
     return _created(call, "Audio URL accepted and call record created. POST /process to analyze.")
+
+
+@router.post("/from-text", response_model=CallCreatedResponse, status_code=201)
+def create_call_from_text(request: CallFromTextRequest, db: Database = Depends(get_db)) -> dict:
+    """Create a call record from a transcript typed/pasted directly.
+
+    No audio and no transcription: the transcript document is created up
+    front and `transcript_id` is set on the call before it's even inserted,
+    so /process's existing transcript-reuse check skips straight to analysis.
+    """
+    _require_analyzer_enabled()
+    _require_lead_and_caller(db, request.lead_id, request.caller_id)
+
+    source = audio_service.AudioSource(
+        source_type=SourceType.TEXT.value,
+        file_path=None,
+        url=None,
+        mime_type="text/plain",
+        size_bytes=len(request.transcript.encode("utf-8")),
+        filename=None,
+        duration_seconds=None,
+    )
+    call = _new_call_doc(request.lead_id, request.caller_id, source)
+
+    transcript_doc = {
+        "transcript_id": audio_service.new_id("TR"),
+        "call_id": call["call_id"],
+        "lead_id": request.lead_id,
+        "caller_id": request.caller_id,
+        "transcript": request.transcript,
+        "language": None,
+        "duration_seconds": None,
+        "provider": "user_text",
+        "created_at": call["created_at"],
+    }
+    db[CALL_TRANSCRIPTS].insert_one(transcript_doc)
+    call["transcript_id"] = transcript_doc["transcript_id"]
+    db[CALLS].insert_one(call)
+    return _created(call, "Transcript received and call record created. POST /process to analyze.")
 
 
 # --------------------------------------------------------------------------

@@ -187,7 +187,7 @@ def process_call(db: Database, call: dict) -> ProcessResult:
         # Persist the failed attempt(s) is handled below via run; here nothing
         # succeeded and fallback is disabled, so record the failure and stop.
         failed_doc = _analysis_doc(
-            call, AnalysisAttempt(model=llm_service.settings.vertex_ai_model, result=None,
+            call, AnalysisAttempt(model=llm_service.settings.call_analysis_model, result=None,
                                   raw_response=None, error=str(exc)),
         )
         db[CALL_ANALYSES].insert_one(failed_doc)

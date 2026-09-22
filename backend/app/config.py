@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     google_credentials_json: str = Field("", alias="GOOGLE_CREDENTIALS_JSON")
     google_genai_use_vertexai: bool = Field(True, alias="GOOGLE_GENAI_USE_VERTEXAI")
 
+    # ---- Call-outcome analysis (OpenAI-compatible chat-completions) --------
+    # Separate from Vertex AI above -- this is only for turning a transcript
+    # into outcome/follow-up JSON. `call_analysis_config_error` turns a blank
+    # value into a readable message at call time, same pattern as Vertex AI.
+    call_analysis_api_url: str = Field(
+        "https://ai.hyrenet-staging.in/v1/chat/completions", alias="CALL_ANALYSIS_API_URL"
+    )
+    call_analysis_api_key: str = Field("", alias="CALL_ANALYSIS_API_KEY")
+    call_analysis_model: str = Field("global.anthropic.claude-sonnet-5", alias="CALL_ANALYSIS_MODEL")
+
     # ---- Feature gate --------------------------------------------------------
     # The entire "Analyze New Call" section (UI) and its ingestion/processing
     # endpoints are hidden/disabled unless this is explicitly set to true.
@@ -131,6 +141,27 @@ class Settings(BaseSettings):
             return (
                 f"GOOGLE_APPLICATION_CREDENTIALS points to '{creds}', which does not exist. "
                 "Fix the path, or leave it blank to use Application Default Credentials."
+            )
+        return None
+
+    def call_analysis_config_error(self) -> str | None:
+        """Return a readable reason the call-outcome analysis endpoint cannot be
+        used, or None if it can.
+
+        Checked at call time, not at startup, so the app boots and
+        transcription keeps working even when this isn't configured yet.
+        """
+        if not self.call_analysis_api_url.strip():
+            return "CALL_ANALYSIS_API_URL is not set in backend/.env."
+        if not self.call_analysis_api_key.strip():
+            return (
+                "CALL_ANALYSIS_API_KEY is not set in backend/.env. Set it to a valid API key "
+                "for the call-outcome analysis endpoint."
+            )
+        if not self.call_analysis_model.strip():
+            return (
+                "CALL_ANALYSIS_MODEL is not set in backend/.env "
+                "(e.g. global.anthropic.claude-sonnet-5)."
             )
         return None
 

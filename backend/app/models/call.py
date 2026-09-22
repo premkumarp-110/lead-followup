@@ -27,6 +27,7 @@ class CallStatus(str, Enum):
 class SourceType(str, Enum):
     UPLOAD = "UPLOAD"
     URL = "URL"
+    TEXT = "TEXT"
 
 
 class Call(BaseModel):

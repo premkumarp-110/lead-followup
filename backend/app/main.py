@@ -32,7 +32,7 @@ async def lifespan(app: FastAPI):
         "(playback %s).",
         settings.database_name,
         settings.transcription_provider,
-        settings.vertex_ai_model,
+        settings.call_analysis_model,
         settings.audio_storage_mode,
         "on" if settings.audio_playback_enabled else "off",
     )
@@ -140,7 +140,7 @@ def ui_config() -> dict:
         "max_audio_mb": settings.max_audio_mb,
         "allowed_audio_types": settings.allowed_audio_extensions,
         "transcription_provider": settings.transcription_provider,
-        "analysis_model": settings.vertex_ai_model,
+        "analysis_model": settings.call_analysis_model,
         "vertex_configured": settings.vertex_config_error() is None,
         "analysis_fallback_enabled": settings.analysis_fallback_enabled,
     }

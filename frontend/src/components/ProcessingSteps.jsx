@@ -5,26 +5,38 @@
  * ANALYZING | updating | COMPLETED | FAILED. Every value except the first and
  * last two comes straight from the backend's call status, so this reflects
  * real pipeline state rather than a timer.
+ *
+ * `mode` only changes labels/wording -- a text-mode call still passes through
+ * the same backend states (TRANSCRIBING just resolves instantly since the
+ * transcript was already provided).
  */
-const STEPS = [
-  { key: 'upload', label: 'Audio uploaded', reached: ['UPLOADED', 'PROCESSING', 'TRANSCRIBING', 'ANALYZING', 'updating', 'COMPLETED'], active: ['uploading'] },
-  { key: 'transcribe', label: 'Transcript generated', reached: ['ANALYZING', 'updating', 'COMPLETED'], active: ['PROCESSING', 'TRANSCRIBING'] },
-  { key: 'analyze', label: 'Conversation analyzed', reached: ['updating', 'COMPLETED'], active: ['ANALYZING'] },
-  { key: 'update', label: 'Lead updated', reached: ['COMPLETED'], active: ['updating'] },
-  { key: 'done', label: 'Completed', reached: ['COMPLETED'], active: [] },
-]
-
-const ACTIVE_TEXT = {
-  uploading: 'Uploading audio…',
-  UPLOADED: 'Starting…',
-  PROCESSING: 'Preparing audio…',
-  TRANSCRIBING: 'Transcribing audio…',
-  ANALYZING: 'Analyzing conversation…',
-  updating: 'Updating lead…',
+function stepsFor(mode) {
+  const isText = mode === 'text'
+  return [
+    { key: 'upload', label: isText ? 'Transcript received' : 'Audio uploaded', reached: ['UPLOADED', 'PROCESSING', 'TRANSCRIBING', 'ANALYZING', 'updating', 'COMPLETED'], active: ['uploading'] },
+    { key: 'transcribe', label: isText ? 'Transcript ready' : 'Transcript generated', reached: ['ANALYZING', 'updating', 'COMPLETED'], active: ['PROCESSING', 'TRANSCRIBING'] },
+    { key: 'analyze', label: 'Conversation analyzed', reached: ['updating', 'COMPLETED'], active: ['ANALYZING'] },
+    { key: 'update', label: 'Lead updated', reached: ['COMPLETED'], active: ['updating'] },
+    { key: 'done', label: 'Completed', reached: ['COMPLETED'], active: [] },
+  ]
 }
 
-export default function ProcessingSteps({ stage, failedStage, error }) {
+function activeTextFor(mode) {
+  return {
+    uploading: mode === 'text' ? 'Submitting transcript…' : 'Uploading audio…',
+    UPLOADED: 'Starting…',
+    PROCESSING: 'Preparing audio…',
+    TRANSCRIBING: 'Transcribing audio…',
+    ANALYZING: 'Analyzing conversation…',
+    updating: 'Updating lead…',
+  }
+}
+
+export default function ProcessingSteps({ stage, failedStage, error, mode }) {
   if (stage === 'idle') return null
+
+  const STEPS = stepsFor(mode)
+  const ACTIVE_TEXT = activeTextFor(mode)
 
   // When FAILED, the step matching the failed backend stage is marked failed
   // and everything before it stays checked.

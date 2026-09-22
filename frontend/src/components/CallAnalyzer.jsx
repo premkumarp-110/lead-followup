@@ -28,6 +28,9 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
   const [urlChecking, setUrlChecking] = useState(false)
   const [urlError, setUrlError] = useState('')
 
+  // Text mode
+  const [transcriptText, setTranscriptText] = useState('')
+
   // Association
   const [leads, setLeads] = useState([])
   const [callers, setCallers] = useState([])
@@ -141,8 +144,12 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
     }, POLL_MS)
   }
 
-  const audioReady = mode === 'upload' ? Boolean(file) : Boolean(urlMeta?.reachable)
-  const canAnalyze = audioReady && leadId && callerId && !busy
+  const inputReady = mode === 'upload'
+    ? Boolean(file)
+    : mode === 'url'
+      ? Boolean(urlMeta?.reachable)
+      : Boolean(transcriptText.trim())
+  const canAnalyze = inputReady && leadId && callerId && !busy
 
   async function analyze() {
     if (!canAnalyze) return
@@ -152,7 +159,9 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
       setStage('uploading'); setUploadPct(0)
       const created = mode === 'upload'
         ? await api.uploadCall({ file, leadId, callerId }, setUploadPct)
-        : await api.createCallFromUrl({ audioUrl: audioUrl.trim(), leadId, callerId })
+        : mode === 'url'
+          ? await api.createCallFromUrl({ audioUrl: audioUrl.trim(), leadId, callerId })
+          : await api.createCallFromText({ transcript: transcriptText.trim(), leadId, callerId })
       callId = created.call_id
       setStage('UPLOADED')
 
@@ -180,6 +189,7 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
 
   function startAnother() {
     clearFile(); setAudioUrl(''); setUrlMeta(null); setUrlError('')
+    setTranscriptText('')
     resetOutcome()
   }
 
@@ -227,6 +237,14 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
             >
               Audio URL
             </button>
+            <button
+              type="button" role="tab" aria-selected={mode === 'text'}
+              className={mode === 'text' ? 'active' : ''}
+              onClick={() => { setMode('text'); resetOutcome() }}
+              disabled={busy}
+            >
+              Paste Transcript
+            </button>
           </div>
 
           {mode === 'upload' ? (
@@ -255,7 +273,7 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
               )}
               {fileError && <div className="form-error">{fileError}</div>}
             </div>
-          ) : (
+          ) : mode === 'url' ? (
             <div className="audio-input">
               <div className="url-row">
                 <input
@@ -280,6 +298,20 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
                   </div>
                 </div>
               )}
+            </div>
+          ) : (
+            <div className="audio-input">
+              <textarea
+                placeholder="Paste or type the call transcript here…"
+                value={transcriptText}
+                onChange={(e) => { setTranscriptText(e.target.value); resetOutcome() }}
+                disabled={busy}
+                rows={10}
+                style={{ width: '100%', resize: 'vertical' }}
+              />
+              <div className="sub" style={{ marginTop: 6 }}>
+                No transcription needed — analysis runs directly on this text.
+              </div>
             </div>
           )}
         </div>
@@ -331,8 +363,12 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
           </button>
           {!busy && stage === 'idle' && !canAnalyze && (
             <div className="sub" style={{ marginTop: 6 }}>
-              {!audioReady
-                ? (mode === 'upload' ? 'Choose an audio file to continue.' : 'Validate the audio URL to continue.')
+              {!inputReady
+                ? (mode === 'upload'
+                    ? 'Choose an audio file to continue.'
+                    : mode === 'url'
+                      ? 'Validate the audio URL to continue.'
+                      : 'Paste a transcript to continue.')
                 : 'Select both a lead and a caller to continue.'}
             </div>
           )}
@@ -342,14 +378,14 @@ export default function CallAnalyzer({ config, onCompleted, onOpenLead }) {
       {/* ---------------- Progress + result ---------------- */}
       {stage !== 'idle' && (
         <div className="panel outcome">
-          <ProcessingSteps stage={stage} failedStage={failedStage} error={error} />
+          <ProcessingSteps stage={stage} failedStage={failedStage} error={error} mode={mode} />
           {stage === 'uploading' && uploadPct > 0 && uploadPct < 100 && (
             <div className="sub">Uploading… {uploadPct}%</div>
           )}
 
           {stage === 'FAILED' && (
             <div className="result-actions">
-              <button type="button" className="btn" onClick={analyze} disabled={!audioReady || !leadId || !callerId}>Retry</button>
+              <button type="button" className="btn" onClick={analyze} disabled={!inputReady || !leadId || !callerId}>Retry</button>
               <button type="button" className="btn subtle" onClick={startAnother}>Start over</button>
             </div>
           )}

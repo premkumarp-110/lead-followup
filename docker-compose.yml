@@ -37,6 +37,9 @@ services:
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL:-gemini-2.5-flash}
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/service-account.json
       GOOGLE_GENAI_USE_VERTEXAI: "true"
+      CALL_ANALYSIS_API_URL: ${CALL_ANALYSIS_API_URL:-https://ai.hyrenet-staging.in/v1/chat/completions}
+      CALL_ANALYSIS_API_KEY: ${CALL_ANALYSIS_API_KEY}
+      CALL_ANALYSIS_MODEL: ${CALL_ANALYSIS_MODEL:-global.anthropic.claude-sonnet-5}
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vertex}
       ANALYSIS_FALLBACK_ENABLED: ${ANALYSIS_FALLBACK_ENABLED:-true}
       AUDIO_STORAGE_MODE: ${AUDIO_STORAGE_MODE:-local}

@@ -68,6 +68,8 @@ export const api = {
   validateAudioUrl: (audioUrl) => request(client.post('/api/calls/validate-url', { audio_url: audioUrl })),
   createCallFromUrl: ({ audioUrl, leadId, callerId }) =>
     request(client.post('/api/calls/from-url', { audio_url: audioUrl, lead_id: leadId, caller_id: callerId })),
+  createCallFromText: ({ transcript, leadId, callerId }) =>
+    request(client.post('/api/calls/from-text', { transcript, lead_id: leadId, caller_id: callerId })),
 
   // ---- processing ----
   processCall: (callId) => request(longClient.post(`/api/calls/${callId}/process`)),
