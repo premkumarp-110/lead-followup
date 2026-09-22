@@ -1,15 +1,20 @@
-"""Lead read endpoints and follow-up actions."""
+"""Lead read endpoints and follow-up actions.
+
+Literal sub-paths (/follow-ups, /closed, ...) are declared BEFORE /{lead_id};
+anything added below /{lead_id} would match as a lead id instead.
+"""
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pymongo.database import Database
 
-from app.database import CALL_OUTCOMES, CALL_TRANSCRIPTS, CALLS, LEADS, get_db
-from app.models.call import Call, CallOutcome, CallTranscript
-from app.models.lead import FollowUpStatus
+from app.database import CALL_ANALYSES, CALL_TRANSCRIPTS, CALLERS, CALLS, LEADS, get_db
+from app.models.analysis import CallAnalysis
+from app.models.call import Call, CallTranscript
+from app.models.lead import FollowUpStatus, LeadStatus
 from app.models.schemas import FollowUpActionRequest, LeadDetail, LeadListItem
 from app.routes.filters import LeadFilters, apply_bucket_filter, lead_filters
 from app.services import followup_service
-from app.services.followup_service import decorate_lead, utcnow
+from app.services.followup_service import decorate_lead, sort_worklist, utcnow
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -18,6 +23,13 @@ router = APIRouter(prefix="/api/leads", tags=["leads"])
 ACTIVE_FOLLOW_UP_QUERY = {
     "follow_up.required": True,
     "follow_up.status": FollowUpStatus.PENDING.value,
+}
+
+CLOSED_QUERY = {
+    "$or": [
+        {"lead_status": {"$in": [LeadStatus.CONVERTED.value, LeadStatus.DROPPED.value]}},
+        {"follow_up.status": {"$in": [FollowUpStatus.COMPLETED.value, FollowUpStatus.CANCELLED.value]}},
+    ]
 }
 
 
@@ -37,7 +49,30 @@ def _get_lead_or_404(db: Database, lead_id: str) -> dict:
 
 
 def _latest_call(db: Database, lead_id: str) -> dict | None:
-    return db[CALLS].find_one({"lead_id": lead_id}, sort=[("ended_at", -1)])
+    return db[CALLS].find_one({"lead_id": lead_id}, sort=[("ended_at", -1), ("created_at", -1)])
+
+
+def _latest_analysis(db: Database, lead: dict) -> dict | None:
+    if lead.get("latest_analysis_id"):
+        found = db[CALL_ANALYSES].find_one({"analysis_id": lead["latest_analysis_id"]})
+        if found:
+            return found
+    return db[CALL_ANALYSES].find_one(
+        {"lead_id": lead["lead_id"], "status": "COMPLETED"}, sort=[("created_at", -1)]
+    )
+
+
+def _latest_transcript(db: Database, lead_id: str, call: dict | None) -> dict | None:
+    if call and call.get("transcript_id"):
+        found = db[CALL_TRANSCRIPTS].find_one({"transcript_id": call["transcript_id"]})
+        if found:
+            return found
+    return db[CALL_TRANSCRIPTS].find_one({"lead_id": lead_id}, sort=[("created_at", -1)])
+
+
+# --------------------------------------------------------------------------
+# Lists
+# --------------------------------------------------------------------------
 
 
 @router.get("", response_model=list[LeadListItem])
@@ -57,32 +92,30 @@ def list_follow_ups(
     filters: LeadFilters = Depends(lead_filters),
     db: Database = Depends(get_db),
 ) -> list[dict]:
-    """Leads that currently require action, most overdue first."""
+    """Leads that currently require action: overdue, due, upcoming, then unscheduled."""
     query = filters.mongo_query(ACTIVE_FOLLOW_UP_QUERY)
-    docs = list(db[LEADS].find(query).sort("follow_up.datetime", 1))
+    docs = list(db[LEADS].find(query))
     now = utcnow()
-    return [decorate_lead(d, now) for d in apply_bucket_filter(docs, filters, now)]
+    decorated = [decorate_lead(d, now) for d in apply_bucket_filter(docs, filters, now)]
+    return sort_worklist(decorated)
 
 
-@router.get("/non-follow-ups", response_model=list[LeadListItem])
-def list_non_follow_ups(
+@router.get("/closed", response_model=list[LeadListItem])
+@router.get("/non-follow-ups", response_model=list[LeadListItem], include_in_schema=False)
+def list_closed(
     filters: LeadFilters = Depends(lead_filters),
     db: Database = Depends(get_db),
 ) -> list[dict]:
-    """Converted, dropped and otherwise closed leads."""
-    base = {
-        "$or": [
-            {"follow_up.required": {"$ne": True}},
-            {
-                "follow_up.status": {
-                    "$in": [FollowUpStatus.COMPLETED.value, FollowUpStatus.CANCELLED.value]
-                }
-            },
-        ]
-    }
-    docs = list(db[LEADS].find(filters.mongo_query(base)).sort("updated_at", -1))
+    """Converted, dropped, and leads whose follow-up was completed or cancelled."""
+    query = filters.mongo_query(CLOSED_QUERY)
+    docs = list(db[LEADS].find(query).sort("updated_at", -1))
     now = utcnow()
     return [decorate_lead(d, now) for d in apply_bucket_filter(docs, filters, now)]
+
+
+# --------------------------------------------------------------------------
+# Single lead
+# --------------------------------------------------------------------------
 
 
 @router.get("/{lead_id}", response_model=LeadDetail)
@@ -92,48 +125,43 @@ def get_lead(lead_id: str, db: Database = Depends(get_db)) -> dict:
     detail = decorate_lead(lead)
 
     call = _latest_call(db, lead_id)
-    transcript = None
-    outcome = None
-    if call:
-        transcript = db[CALL_TRANSCRIPTS].find_one({"call_id": call["call_id"]})
-        outcome = db[CALL_OUTCOMES].find_one({"call_id": call["call_id"]})
-    if transcript is None:
-        transcript = db[CALL_TRANSCRIPTS].find_one({"lead_id": lead_id}, sort=[("created_at", -1)])
-    if outcome is None:
-        outcome = db[CALL_OUTCOMES].find_one({"lead_id": lead_id}, sort=[("processed_at", -1)])
-
+    caller = (
+        db[CALLERS].find_one({"caller_id": call["caller_id"]}) if call and call.get("caller_id") else None
+    )
     detail["latest_call"] = _strip_id(call)
-    detail["latest_transcript"] = _strip_id(transcript)
-    detail["latest_call_outcome"] = _strip_id(outcome)
+    detail["latest_caller"] = _strip_id(caller)
+    detail["latest_transcript"] = _strip_id(_latest_transcript(db, lead_id, call))
+    detail["latest_analysis"] = _strip_id(_latest_analysis(db, lead))
     return detail
 
 
 @router.get("/{lead_id}/calls", response_model=list[Call])
 def get_lead_calls(lead_id: str, db: Database = Depends(get_db)) -> list[dict]:
     _get_lead_or_404(db, lead_id)
-    return [_strip_id(c) for c in db[CALLS].find({"lead_id": lead_id}).sort("ended_at", -1)]
+    return [_strip_id(c) for c in db[CALLS].find({"lead_id": lead_id}).sort("created_at", -1)]
 
 
-@router.get("/{lead_id}/transcript/latest", response_model=CallTranscript)
+@router.get("/{lead_id}/latest-transcript", response_model=CallTranscript)
+@router.get("/{lead_id}/transcript/latest", response_model=CallTranscript, include_in_schema=False)
 def get_latest_transcript(lead_id: str, db: Database = Depends(get_db)) -> dict:
     _get_lead_or_404(db, lead_id)
-    transcript = db[CALL_TRANSCRIPTS].find_one({"lead_id": lead_id}, sort=[("created_at", -1)])
+    transcript = _latest_transcript(db, lead_id, _latest_call(db, lead_id))
     if transcript is None:
         raise HTTPException(status_code=404, detail=f"No transcript found for lead '{lead_id}'")
     return _strip_id(transcript)
 
 
-@router.get("/{lead_id}/outcome", response_model=CallOutcome)
-def get_latest_outcome(lead_id: str, db: Database = Depends(get_db)) -> dict:
-    _get_lead_or_404(db, lead_id)
-    outcome = db[CALL_OUTCOMES].find_one({"lead_id": lead_id}, sort=[("processed_at", -1)])
-    if outcome is None:
+@router.get("/{lead_id}/latest-analysis", response_model=CallAnalysis)
+@router.get("/{lead_id}/outcome", response_model=CallAnalysis, include_in_schema=False)
+def get_latest_analysis(lead_id: str, db: Database = Depends(get_db)) -> dict:
+    lead = _get_lead_or_404(db, lead_id)
+    analysis = _latest_analysis(db, lead)
+    if analysis is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No processed call outcome for lead '{lead_id}'. "
-            "Run POST /api/calls/{call_id}/process first.",
+            detail=f"No completed analysis for lead '{lead_id}'. Process a call first.",
         )
-    return _strip_id(outcome)
+    return _strip_id(analysis)
 
 
 @router.patch("/{lead_id}/follow-up", response_model=LeadDetail)

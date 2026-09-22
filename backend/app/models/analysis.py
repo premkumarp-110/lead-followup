@@ -19,6 +19,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.models.call import Outcome
 
+# Alias: AnalysisFollowUp has a field literally named "datetime" (per the spec),
+# which would otherwise shadow the datetime class inside that class body.
+DateTime = datetime
+
 # Exact wording required by spec S12 when a follow-up is needed but the lead
 # never gave a date. Kept as a constant so the LLM prompt and the server-side
 # backfill can never drift apart.
@@ -55,7 +59,7 @@ class AnalysisFollowUp(BaseModel):
 
     date: str | None = None       # YYYY-MM-DD
     time: str | None = None       # HH:MM
-    datetime: datetime | None = None
+    datetime: DateTime | None = None
     reason: str | None = None
 
     @field_validator("date", "time", "reason", "datetime", mode="before")
@@ -76,9 +80,11 @@ class AnalysisFollowUp(BaseModel):
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)
                 object.__setattr__(self, "datetime", when)
-            utc = when.astimezone(timezone.utc)
-            object.__setattr__(self, "date", utc.strftime("%Y-%m-%d"))
-            object.__setattr__(self, "time", utc.strftime("%H:%M"))
+            # Render date/time in the offset the model returned (the lead's own
+            # timezone), so "call me at 11 AM" is stored as time "11:00", not
+            # its UTC equivalent. `datetime` stays the authoritative instant.
+            object.__setattr__(self, "date", when.strftime("%Y-%m-%d"))
+            object.__setattr__(self, "time", when.strftime("%H:%M"))
         elif self.date:
             # date without datetime: combine with time if present, else leave
             # datetime None so the lead lands in the UNSCHEDULED bucket.

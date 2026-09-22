@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import api from '../services/api.js'
+import CallAnalyzer from './CallAnalyzer.jsx'
 import SummaryCards from './SummaryCards.jsx'
 import FilterBar from './FilterBar.jsx'
 import LeadTable from './LeadTable.jsx'
@@ -11,12 +12,16 @@ const EMPTY_FILTERS = {
   date: '', date_from: '', date_to: '', bucket: 'ALL',
 }
 
+// Quick filters that describe closed leads live on the closed tab.
+const CLOSED_BUCKETS = new Set(['CONVERTED', 'DROPPED'])
+
 export default function Dashboard() {
+  const [config, setConfig] = useState(null)
   const [filters, setFilters] = useState(EMPTY_FILTERS)
   const [options, setOptions] = useState({})
   const [summary, setSummary] = useState(null)
   const [followUps, setFollowUps] = useState([])
-  const [nonFollowUps, setNonFollowUps] = useState([])
+  const [closed, setClosed] = useState([])
   const [tab, setTab] = useState('follow-up')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -32,17 +37,19 @@ export default function Dashboard() {
     setLoading(true)
     setError('')
     try {
-      // The bucket filter only makes sense for the active worklist; the closed
-      // list ignores it so switching tabs never shows an empty table by accident.
+      const closedFilter = CLOSED_BUCKETS.has(filters.bucket)
+      // Bucket filters are worklist concepts; the closed list only honours the
+      // CONVERTED / DROPPED ones and ignores the rest so switching tabs never
+      // shows an empty table by accident.
       const { bucket, ...shared } = filters
-      const [summaryData, followUpData, nonFollowUpData] = await Promise.all([
+      const [summaryData, followUpData, closedData] = await Promise.all([
         api.getSummary(filters),
-        api.getFollowUps(filters),
-        api.getNonFollowUps(shared),
+        api.getFollowUps(closedFilter ? shared : filters),
+        api.getClosed(closedFilter ? filters : shared),
       ])
       setSummary(summaryData)
       setFollowUps(followUpData)
-      setNonFollowUps(nonFollowUpData)
+      setClosed(closedData)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -53,8 +60,14 @@ export default function Dashboard() {
   useEffect(() => { load() }, [load])
 
   useEffect(() => {
+    api.getConfig().then(setConfig).catch(() => setConfig({ audio_playback_enabled: true }))
     api.getFilterOptions().then(setOptions).catch(() => {})
   }, [])
+
+  function selectBucket(bucket) {
+    setFilters((f) => ({ ...f, bucket }))
+    setTab(CLOSED_BUCKETS.has(bucket) ? 'closed' : 'follow-up')
+  }
 
   async function openLead(leadId) {
     setDetailLeadId(leadId)
@@ -79,50 +92,53 @@ export default function Dashboard() {
     if (detailLeadId === pendingAction.lead.lead_id) await openLead(detailLeadId)
   }
 
-  const activeLeads = tab === 'follow-up' ? followUps : nonFollowUps
+  function onCallAnalyzed(result) {
+    const outcome = (result.outcome || '').replaceAll('_', ' ').toLowerCase()
+    setNotice(`Call ${result.call_id} analyzed — outcome: ${outcome}. Dashboard refreshed.`)
+    load()
+  }
+
+  const activeLeads = tab === 'follow-up' ? followUps : closed
 
   return (
     <div className="page">
       <header className="page-header">
         <div>
-          <h1>Lead Follow-up Dashboard</h1>
-          <p>Which leads need to be contacted, based on the latest call with each lead.</p>
+          <h1>Lead Follow-up Management</h1>
+          <p>After every call, the conversation is analyzed and the lead's next action is decided.</p>
         </div>
         <button className="btn" onClick={load} disabled={loading}>
           {loading ? 'Refreshing…' : 'Refresh'}
         </button>
       </header>
 
+      {config?.call_analyzer_enabled && (
+        <CallAnalyzer config={config} onCompleted={onCallAnalyzed} onOpenLead={openLead} />
+      )}
+
       {error && <div className="banner error">{error}</div>}
       {notice && (
         <div className="banner info" onClick={() => setNotice('')} role="status">{notice}</div>
       )}
 
-      <SummaryCards
-        summary={summary}
-        activeBucket={filters.bucket}
-        onSelectBucket={(bucket) => { setFilters((f) => ({ ...f, bucket })); setTab('follow-up') }}
-      />
+      <SummaryCards summary={summary} activeBucket={filters.bucket} onSelectBucket={selectBucket} />
 
       <FilterBar
         filters={filters}
         options={options}
-        onChange={setFilters}
-        onReset={() => setFilters(EMPTY_FILTERS)}
+        onChange={(next) => {
+          setFilters(next)
+          if (next.bucket !== filters.bucket) setTab(CLOSED_BUCKETS.has(next.bucket) ? 'closed' : 'follow-up')
+        }}
+        onReset={() => { setFilters(EMPTY_FILTERS); setTab('follow-up') }}
       />
 
       <div className="tabs">
-        <button
-          className={`tab ${tab === 'follow-up' ? 'active' : ''}`}
-          onClick={() => setTab('follow-up')}
-        >
-          Follow-ups Required ({followUps.length})
+        <button className={`tab ${tab === 'follow-up' ? 'active' : ''}`} onClick={() => setTab('follow-up')}>
+          Leads Requiring Follow-up ({followUps.length})
         </button>
-        <button
-          className={`tab ${tab === 'non-follow-up' ? 'active' : ''}`}
-          onClick={() => setTab('non-follow-up')}
-        >
-          No Follow-up Needed ({nonFollowUps.length})
+        <button className={`tab ${tab === 'closed' ? 'active' : ''}`} onClick={() => setTab('closed')}>
+          Completed / Closed ({closed.length})
         </button>
       </div>
 
@@ -139,6 +155,7 @@ export default function Dashboard() {
           lead={detail}
           loading={detailLoading}
           error={detailError}
+          config={config}
           onClose={() => { setDetailLeadId(null); setDetail(null) }}
         />
       )}

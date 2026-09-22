@@ -4,129 +4,165 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Lead Follow-up Management Dashboard — an MVP that tells a BD executive which leads to contact
-next, derived from the outcome of each lead's most recent call. FastAPI + PyMongo backend,
-React 18 + Vite frontend, local MongoDB. No auth, no LeadSquared integration.
+AI-Powered Lead Follow-up Management System — an internal EdTech BD tool. A BD uploads a call
+recording (or an audio URL), links it to a lead and a caller; the backend transcribes it and
+analyzes it with Vertex AI Gemini, validates the result, decides FOLLOW_UP_REQUIRED / CONVERTED /
+DROPPED, and updates the lead and dashboard. FastAPI + PyMongo backend, React 18 + Vite frontend,
+local MongoDB. No auth, no LeadSquared, no queues — deliberate MVP scope.
 
-`README.md` documents the full API surface, seed data, filter params and LLM-integration plan.
+`README.md` documents setup, every env var, the API, and the analysis contract.
 `MODULES.md` is the build tracker — update it when completing a module of work.
 
 ## Commands
 
-Backend (from `backend/`, venv already exists at `backend/.venv`):
+Backend (from `backend/`, venv at `backend/.venv`):
 
 ```bash
 source .venv/bin/activate
 pip install -r requirements.txt
-python seed.py                      # drops + recreates all 4 collections, reseeds
+python seed.py                      # drops + recreates all 5 collections; no API calls
 uvicorn app.main:app --reload       # :8000, docs at /docs
-python check_analyzer.py            # analyzer regression check (see below)
+python check_analyzer.py            # 11-case regression check for the fallback analyzer
 ```
 
-Frontend (from `frontend/`):
+Frontend (from `frontend/`): `npm install`, `npm run dev` (:5173), `npm run build`.
 
-```bash
-npm install
-npm run dev                         # :5173
-npm run build
-```
+`docker compose up --build` runs mongo + backend + frontend; it needs a root `.env` (see
+`.env.example`) and a service-account key mounted from `GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH`.
 
-MongoDB must be running (`sudo systemctl start mongod`); the backend pings it at startup and
-fails fast with a readable message if it is not.
-
-Copy `backend/.env.example` → `backend/.env` and `frontend/.env.example` → `frontend/.env` before
-first run. There is no Mongo URL default in code — a missing `MONGODB_URL` is a startup error by
-design, not something to "fix" with a fallback.
+MongoDB must be running. `ffprobe` (from ffmpeg) is used for durations; absent it degrades to
+`duration_seconds: null`, never an error.
 
 ### Tests
 
-There is no pytest/vitest suite. `backend/check_analyzer.py` is the only automated check: 9 cases
-(the spec's sample transcripts plus edge cases) asserting outcome and resolved follow-up datetime
-against a fixed reference time. Run it after any change to `call_analyzer.py`; to check one case,
-edit or trim the `CASES` list.
+No pytest/vitest suite. `backend/check_analyzer.py` is the only automated check — run it after
+touching `call_analyzer.py`. Vertex code paths cannot be unit-tested offline; the recipe for
+verifying the pipeline without Vertex is in the "Fallback" section below.
+
+## Configuration
+
+`CALL_ANALYZER_ENABLED` (default `false`) gates the "Analyze New Call" feature end to end: the
+frontend only mounts `CallAnalyzer.jsx` when `config.call_analyzer_enabled` is true (from
+`GET /api/config`), and the backend independently enforces it — `_require_analyzer_enabled()` in
+`routes/calls.py` returns 403 from `/upload`, `/validate-url`, `/from-url` and `/{id}/process`
+when it's off. Read endpoints (status, transcript, analysis, audio, lists) are never gated, so
+history produced while it was on stays viewable. Never gate a read endpoint on this flag.
+
+`app/config.py` loads `backend/.env`. `MONGODB_URL`/`DATABASE_NAME` are required at startup.
+Vertex settings are **checked lazily** via `settings.vertex_config_error()` so the app boots,
+seeds and serves the dashboard on an unconfigured machine; only AI routes fail, with a message
+naming the missing setting. Don't add a startup assertion for Vertex.
+
+The frontend never reads backend `.env`. Non-secret flags reach it through `GET /api/config`
+(`UIConfig` in `schemas.py`). Adding a UI-relevant setting means adding it there.
 
 ## Architecture
 
-### Call analysis is a separate flow from the call record
+### Pipeline order lives in exactly one file
 
-Storing a call, storing its transcript, and analyzing that transcript are three distinct steps.
-Analysis only happens on `POST /api/calls/{call_id}/process` — that endpoint is the seam where a
-future "call completed" worker or webhook plugs in.
+`services/call_analysis_service.py::process_call()` is the orchestrator: it calls
+`transcription_service.transcribe_audio()` → `llm_service.analyze_conversation()` →
+`followup_service.apply_analysis_to_lead()`, and writes the call's `status` at every transition
+(`PROCESSING → TRANSCRIBING → ANALYZING → COMPLETED` / `FAILED` + `failed_stage`). Routes stay
+thin. Moving to a background worker later means calling `process_call()` from the worker.
 
-### `call_analyzer.py` is the LLM swap point — keep it sealed
+Re-processing a call reuses its stored transcript (`transcript_id` on the call), so a retry only
+repeats the step that failed.
 
-Everything downstream depends only on `AnalysisResult`, the `CallAnalyzer` protocol, and
-`get_analyzer()`. Never import `KeywordCallAnalyzer` (or any concrete analyzer) from routes,
-services or `seed.py`; go through `get_analyzer()` / the module-level `analyze_call()`. A new
-backend is added by registering a class in `_ANALYZERS` and setting `ANALYZER_BACKEND` in `.env` —
-no route, schema or frontend change. `AnalysisResult`'s shape is deliberately 1:1 with the JSON an
-LLM will return.
+### `llm_service.py` is the LLM swap point
 
-This version makes **no network or LLM calls of any kind**; that is an explicit acceptance
-criterion, not an oversight.
+`analyze_conversation()` returns an `AnalysisRun` — a list of `AnalysisAttempt`s. The orchestrator
+persists **every** attempt to `call_analyses` (failed ones carry `raw_response` + `error`) and
+points `calls.analysis_id` at `run.final`. The Gemini call uses `response_mime_type=application/json`
+plus `RESPONSE_SCHEMA`, then validates through `CallAnalysisResult`, with one repair retry that
+quotes the validation error back. `vertex_client.py` owns client construction and turns SDK
+exceptions into user-safe wording (`describe_api_error`) — both Gemini callers go through it.
 
-Analyzer rule order is `DROPPED → CONVERTED → FOLLOW_UP → fallback`, and that order is load-bearing
-("I paid for another course, not interested in this one" must resolve to DROPPED). The fallback
-always returns `FOLLOW_UP_REQUIRED` with low `confidence` so a lead is never silently dropped from
-the worklist.
+### `CallAnalysisResult` is the trust boundary (models/analysis.py)
+
+Raw model output never reaches the lead without passing this model. Strictness is deliberately
+uneven: `outcome` is strict (it drives `lead_status`); `customer_intent` normalises unknown labels
+to `UNCLEAR`; `confidence` accepts `94` as `0.94`. The `model_validator` makes outcome and
+follow-up agree: CONVERTED/DROPPED force `follow_up=None`; FOLLOW_UP_REQUIRED with no datetime
+gets `NO_DATE_REASON`. `AnalysisFollowUp` derives `date`/`time` from `datetime` in the *returned
+offset* (IST), not UTC — the spec's example shape depends on that.
+
+Two models have a field literally named `datetime` (`FollowUp`, `AnalysisFollowUp`); both use a
+`DateTime = datetime` alias to avoid shadowing. Keep doing that.
+
+### Fallback when Gemini fails
+
+If Vertex is unreachable/misconfigured or JSON fails validation after the retry, and
+`ANALYSIS_FALLBACK_ENABLED` (default true), `call_analyzer.py` (deterministic keywords) produces
+the result flagged `degraded=True, model="keyword-fallback-v1"`. Rule order DROPPED → CONVERTED →
+FOLLOW_UP is load-bearing. It **never invents a date**: no extractable date → `datetime=None`.
+
+To exercise the whole pipeline offline: upload a file, insert a `call_transcripts` doc, set
+`transcript_id` on the call, then `POST /process` — transcription is skipped, Gemini fails on
+config, fallback runs, two analysis docs are written, lead updates.
+
+Transcription has **no** fallback; only `vertex` is implemented in `transcription_service.py`.
+`local`/`gcp-stt` are registered so they fail with a specific message (spec §8).
 
 ### Stored vs. derived follow-up state
 
-`follow_up.status` stores only durable state: `PENDING` / `COMPLETED` / `CANCELLED`.
-The time-sensitive bucket (`OVERDUE` / `DUE` / `UPCOMING`) is **computed on every read** by
-`followup_service.compute_bucket()` and attached as `follow_up.bucket` by `decorate_lead()`.
-Never persist a bucket. `FollowUpStatus.OVERDUE` exists only so the `?status=` query param accepts
-it; `filters.py` routes it to the derived-bucket path and never writes it.
+`follow_up.status` stores only `PENDING` / `COMPLETED` / `CANCELLED`. The bucket (`OVERDUE` /
+`DUE` / `UPCOMING` / `UNSCHEDULED`) is computed on every read by
+`followup_service.compute_bucket()` and attached by `decorate_lead()`. Never persist a bucket.
+`UNSCHEDULED` = required + PENDING + `datetime: None`; it counts in `follow_ups_required` but not
+in due/overdue/upcoming, and `sort_worklist()` puts it last (Mongo sorts nulls *first*, so the
+worklist is re-sorted in Python). `FollowUpStatus.OVERDUE` exists only so `?status=` accepts it.
 
 ### Filtering is two-phase — both halves are required
 
-`routes/filters.py` owns one shared `LeadFilters` dependency used by the leads and dashboard
-routes, so filters AND together identically everywhere:
+`routes/filters.py` owns the shared `LeadFilters` dependency: `mongo_query(base)` for what Mongo
+can evaluate, then `apply_bucket_filter(docs, filters, now)` for derived buckets. Any new list
+endpoint must call both or `?bucket=` is silently ignored. `CONVERTED`/`DROPPED` are accepted as
+`bucket` values and become a `lead_status` clause in `mongo_query` (the frontend switches to the
+closed tab for them). One `now` per request.
 
-1. `filters.mongo_query(base)` — the part Mongo can evaluate.
-2. `apply_bucket_filter(docs, filters, now)` — the derived-bucket part Mongo cannot.
+### Denormalization and the latest-call guard
 
-Any new list endpoint must call both, or `?bucket=` is silently ignored. `compute_bucket` is
-called with a single `now` per request so rows in one response can't disagree about time.
+`call_analyses` is the source of truth; `leads.follow_up` is a denormalized copy of the winning
+analysis. `apply_analysis_to_lead()` only updates the lead when no **COMPLETED** call for that lead
+ended later (`is_latest_call`). Unprocessed/failed calls don't count — they have no outcome to
+protect. Replaying an older recording therefore can't overwrite a newer outcome, but an abandoned
+upload can't block a real one either.
 
-### Denormalization and idempotency
+### Audio
 
-`call_outcomes` is the source of truth for an analysis result; the lead's `follow_up` block is a
-denormalized copy of the latest outcome so the dashboard's main query is one indexed find.
-`followup_service.apply_analysis()` enforces two invariants:
-
-- Upsert keyed on `call_id` (uniquely indexed in `database.py`) — reprocessing overwrites instead
-  of duplicating, and the response reports `already_processed`.
-- The lead is only updated when this call is the lead's **most recent** call (`_is_latest_call`),
-  so replaying an older call cannot resurrect a stale follow-up. The response reports
-  `applied_to_lead: false` in that case.
-
-Every BD action (`COMPLETE` / `CANCEL` / `RESCHEDULE`) requires a `reason` and appends an entry to
-`follow_up_history`. Acting on a lead with no active follow-up raises `ValueError` → 409/422.
+`audio_service.py` owns validation and storage. Stored filenames derive from `call_id`, never the
+client's name. `audio_file_path` is `exclude=True` on the `Call` model — the browser only ever gets
+`GET /api/calls/{id}/audio`, which resolves the path from the call doc and refuses anything outside
+`settings.upload_path`. URL calls redirect (307). `validate_audio_url` resolves DNS and rejects
+private/loopback/link-local hosts before any request (SSRF guard). MIME checks are lenient when the
+extension is allow-listed — hosts serve `.ogg` as `application/ogg` — but `text/html` etc. are
+always refused. `MAX_AUDIO_MB=20` tracks Gemini's inline-audio cap.
 
 ### Time
 
-All datetimes are tz-aware UTC. `MongoClient` is created with `tz_aware=True`, and
-`followup_service._as_utc()` guards anything that might come back naive. The browser does the local
-formatting (`frontend/src/components/format.js`). The `DUE` window is a fixed 2 hours
-(`DUE_WINDOW` in `followup_service.py`).
+All datetimes tz-aware UTC in Mongo (`tz_aware=True` client, `_as_utc()` guard). The LLM prompt
+states the call time in Asia/Kolkata and asks for `+05:30` offsets; the browser formats locally.
+`DUE_WINDOW` is 2 hours.
 
 ### Error handling
 
-`main.py` registers global handlers: `ValueError` → 422, `PyMongoError` → 503. That is why domain
-code in `filters.py` and `followup_service.py` raises plain `ValueError` for bad input rather than
-`HTTPException` — routes only raise `HTTPException` for 404/409.
+`main.py` handlers: `AudioValidationError`/`ValueError` → 422, `TranscriptionError`/
+`VertexUnavailable` → 503, `PyMongoError` → 503, bare `Exception` → 500 with a generic message.
+Domain code raises those types; routes raise `HTTPException` only for 404/409. Never let a stack
+trace into a response body.
 
 ### Route ordering
 
-In `routes/leads.py`, `/follow-ups` and `/non-follow-ups` are declared **before** `/{lead_id}`.
-Adding a new literal sub-path below `/{lead_id}` would make it match as a lead id instead.
+In `routes/leads.py`, `/follow-ups`, `/closed` (alias `/non-follow-ups`) are declared **before**
+`/{lead_id}`. In `routes/calls.py`, `/upload`, `/validate-url`, `/from-url` precede `/{call_id}`.
 
 ### Frontend
 
-`components/Dashboard.jsx` holds all state and all API calls; every other component is
-presentational and receives props. Summary cards, both tables and the filter options are refetched
-together by one `load()` whenever `filters` changes — there is no polling or websocket.
-`services/api.js` wraps axios, strips empty filter values via `cleanParams` (so `?bd=` is never
-sent), and converts axios failures into user-readable messages. The `bucket` filter is applied to
-the follow-ups list only and deliberately stripped before fetching the closed-leads list.
+`Dashboard.jsx` holds dashboard state; `CallAnalyzer.jsx` holds analyzer state and reports
+completion via `onCompleted` so the dashboard refetches. The stepper (`ProcessingSteps.jsx`)
+is driven by polling `GET /api/calls/{id}/status` *during* the synchronous `POST /process` — it
+reflects real backend state. `AudioPlayer.jsx` renders nothing when
+`config.audio_playback_enabled` is false. `api.js` uses a 5-minute timeout client for upload and
+process, 15 s for everything else. Quick-filter chips `CONVERTED`/`DROPPED` switch to the closed
+tab; the closed list ignores other bucket values so tab switches never show an empty table.

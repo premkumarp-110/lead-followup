@@ -1,13 +1,19 @@
-import { badgeFor, formatDateTime, formatDuration, outcomeBadge } from './format.js'
+import AudioPlayer from './AudioPlayer.jsx'
+import {
+  badgeFor, formatDateTime, formatDuration, formatFollowUp, formatPercent, intentBadge, outcomeBadge,
+} from './format.js'
 
-export default function LeadDetailsModal({ lead, loading, error, onClose }) {
+export default function LeadDetailsModal({ lead, loading, error, config, onClose }) {
   const badge = lead ? badgeFor(lead) : null
   const outcome = lead ? outcomeBadge(lead.latest_outcome, lead.lead_status) : null
   const followUp = lead?.follow_up || {}
+  const analysis = lead?.latest_analysis
+  const call = lead?.latest_call
+  const intent = analysis ? intentBadge(analysis.customer_intent) : null
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div>
             <h2>{lead?.name || 'Lead Details'}</h2>
@@ -23,32 +29,70 @@ export default function LeadDetailsModal({ lead, loading, error, onClose }) {
           {lead && !loading && (
             <>
               <section className="section">
-                <h3>Lead Information</h3>
+                <h3>Lead Details</h3>
                 <dl className="kv">
                   <dt>Name</dt><dd>{lead.name}</dd>
                   <dt>Phone</dt><dd>{lead.phone}</dd>
                   <dt>Email</dt><dd>{lead.email}</dd>
                   <dt>Course</dt><dd>{lead.course}</dd>
                   <dt>Assigned BD</dt><dd>{lead.assigned_bd?.name} ({lead.assigned_bd?.id})</dd>
-                  <dt>Lead Status</dt><dd><span className={`badge ${badge.cls}`}>{lead.lead_status}</span></dd>
+                  <dt>Lead Status</dt><dd><span className={`badge ${badge.cls}`}>{lead.lead_status.replaceAll('_', ' ')}</span></dd>
                 </dl>
               </section>
 
               <section className="section">
                 <h3>Latest Call</h3>
-                {lead.latest_call ? (
-                  <dl className="kv">
-                    <dt>Call Date</dt><dd>{formatDateTime(lead.latest_call.ended_at)}</dd>
-                    <dt>Duration</dt><dd>{formatDuration(lead.latest_call.duration_seconds)}</dd>
-                    <dt>Outcome</dt>
-                    <dd>
-                      <span className={`badge ${outcome.cls}`}>{outcome.label}</span>
-                      {lead.latest_call_outcome?.reason && (
-                        <div className="sub" style={{ marginTop: 4 }}>{lead.latest_call_outcome.reason}</div>
-                      )}
-                    </dd>
-                  </dl>
+                {call ? (
+                  <>
+                    <dl className="kv">
+                      <dt>Call Date</dt><dd>{formatDateTime(call.ended_at || call.created_at)}</dd>
+                      <dt>Caller</dt>
+                      <dd>{lead.latest_caller ? `${lead.latest_caller.name} (${lead.latest_caller.caller_id})` : call.caller_id || '—'}</dd>
+                      <dt>Duration</dt><dd>{formatDuration(call.duration_seconds)}</dd>
+                      <dt>Audio Source</dt>
+                      <dd>
+                        {call.source_type === 'URL' ? 'Audio URL' : 'Uploaded file'}
+                        {call.audio_filename && <span className="sub"> · {call.audio_filename}</span>}
+                      </dd>
+                      <dt>Processing</dt>
+                      <dd>
+                        <span className={`badge ${call.status === 'COMPLETED' ? 'converted' : call.status === 'FAILED' ? 'overdue' : 'neutral'}`}>
+                          {call.status}
+                        </span>
+                        {call.error && <div className="sub" style={{ marginTop: 4 }}>{call.error}</div>}
+                      </dd>
+                    </dl>
+                    <div style={{ marginTop: 10 }}>
+                      <AudioPlayer call={call} config={config} />
+                    </div>
+                  </>
                 ) : <p className="sub">No calls recorded yet.</p>}
+              </section>
+
+              <section className="section">
+                <h3>AI Analysis</h3>
+                {analysis ? (
+                  <>
+                    {analysis.degraded && (
+                      <div className="banner warn" style={{ marginBottom: 10 }}>
+                        Produced by the deterministic fallback analyzer — Gemini was unavailable for this call.
+                      </div>
+                    )}
+                    <dl className="kv">
+                      <dt>Outcome</dt><dd><span className={`badge ${outcome.cls}`}>{outcome.label}</span></dd>
+                      <dt>Customer Intent</dt><dd><span className={`badge ${intent.cls}`}>{intent.label}</span></dd>
+                      <dt>Confidence</dt>
+                      <dd>{formatPercent(analysis.confidence)} <span className="sub">· {analysis.model}</span></dd>
+                      <dt>Summary</dt><dd>{analysis.summary || '—'}</dd>
+                      <dt>Key Points</dt>
+                      <dd>
+                        {analysis.key_points?.length
+                          ? <ul className="points">{analysis.key_points.map((p, i) => <li key={i}>{p}</li>)}</ul>
+                          : '—'}
+                      </dd>
+                    </dl>
+                  </>
+                ) : <p className="sub">No analysis yet — process a call for this lead.</p>}
               </section>
 
               <section className="section">
@@ -56,12 +100,11 @@ export default function LeadDetailsModal({ lead, loading, error, onClose }) {
                 {followUp.required ? (
                   <dl className="kv">
                     <dt>Required</dt><dd>Yes</dd>
-                    <dt>Date</dt><dd>{followUp.date || '—'}</dd>
-                    <dt>Time</dt><dd>{followUp.time || '—'}</dd>
+                    <dt>Date</dt><dd>{followUp.datetime ? formatFollowUp(followUp).split(',')[0] : 'Not specified'}</dd>
+                    <dt>Time</dt><dd>{followUp.datetime ? formatFollowUp(followUp).split(', ').slice(1).join(', ') : 'Not specified'}</dd>
                     <dt>Status</dt>
-                    <dd>
-                      {followUp.status} <span className={`badge ${badge.cls}`}>{badge.label}</span>
-                    </dd>
+                    <dd>{followUp.status} <span className={`badge ${badge.cls}`}>{badge.label}</span></dd>
+                    <dt>Reason</dt><dd>{followUp.reason || '—'}</dd>
                   </dl>
                 ) : (
                   <p className="sub">
@@ -71,9 +114,15 @@ export default function LeadDetailsModal({ lead, loading, error, onClose }) {
               </section>
 
               <section className="section">
-                <h3>Latest Conversation</h3>
+                <h3>Latest Transcript</h3>
                 {lead.latest_transcript ? (
-                  <div className="transcript">“{lead.latest_transcript.transcript}”</div>
+                  <>
+                    <div className="transcript">{lead.latest_transcript.transcript}</div>
+                    <div className="sub" style={{ marginTop: 6 }}>
+                      {lead.latest_transcript.language && <>Language: {lead.latest_transcript.language} · </>}
+                      Transcribed by {lead.latest_transcript.provider || 'unknown'}
+                    </div>
+                  </>
                 ) : (
                   <p className="sub">No transcript available for this lead.</p>
                 )}

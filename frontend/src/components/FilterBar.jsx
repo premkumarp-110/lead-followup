@@ -1,8 +1,13 @@
+// The first four narrow the active worklist; Unscheduled is the "needs a date"
+// slice of it; Converted / Dropped switch to the closed tab.
 const QUICK_FILTERS = [
   { value: 'ALL', label: 'All' },
-  { value: 'DUE_TODAY', label: 'Today' },
+  { value: 'DUE_TODAY', label: 'Due Today' },
   { value: 'OVERDUE', label: 'Overdue' },
   { value: 'UPCOMING', label: 'Upcoming' },
+  { value: 'UNSCHEDULED', label: 'Unscheduled' },
+  { value: 'CONVERTED', label: 'Converted' },
+  { value: 'DROPPED', label: 'Dropped' },
 ]
 
 export default function FilterBar({ filters, options, onChange, onReset }) {

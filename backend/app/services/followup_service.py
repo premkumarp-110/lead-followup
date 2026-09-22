@@ -1,19 +1,22 @@
 """Follow-up domain logic.
 
-Turns an AnalysisResult into persisted state (call_outcomes + the lead's
-denormalized follow-up block), derives the time-sensitive bucket at read time,
-and applies BD actions (complete / cancel / reschedule).
+Turns a validated analysis into persisted state (the lead's denormalized
+follow-up block), derives the time-sensitive bucket at read time, and applies
+BD actions (complete / cancel / reschedule).
+
+This module does not know where an analysis came from -- Gemini, the keyword
+fallback and the seed all arrive here as a `CallAnalysisResult`.
 """
 
 from datetime import datetime, timedelta, timezone
 
 from pymongo.database import Database
 
-from app.database import CALL_OUTCOMES, CALLS, LEADS
-from app.models.call import Outcome
+from app.database import CALLS, LEADS
+from app.models.analysis import CallAnalysisResult
+from app.models.call import CallStatus, Outcome
 from app.models.lead import FollowUpAction, FollowUpBucket, FollowUpStatus, LeadStatus
 from app.models.schemas import FollowUpActionRequest
-from app.services.call_analyzer import AnalysisResult
 
 # A follow-up counts as DUE (rather than UPCOMING) once it is this close.
 DUE_WINDOW = timedelta(hours=2)
@@ -22,6 +25,15 @@ OUTCOME_TO_LEAD_STATUS = {
     Outcome.FOLLOW_UP_REQUIRED: LeadStatus.FOLLOW_UP,
     Outcome.CONVERTED: LeadStatus.CONVERTED,
     Outcome.DROPPED: LeadStatus.DROPPED,
+}
+
+# Order used when sorting the active worklist: most urgent first, and leads
+# with no date at the end (they need a call to *set* a date, not a timed one).
+BUCKET_SORT_ORDER = {
+    FollowUpBucket.OVERDUE.value: 0,
+    FollowUpBucket.DUE.value: 1,
+    FollowUpBucket.UPCOMING.value: 2,
+    FollowUpBucket.UNSCHEDULED.value: 3,
 }
 
 
@@ -52,7 +64,8 @@ def compute_bucket(follow_up: dict | None, now: datetime | None = None) -> Follo
 
     when = _as_utc(follow_up.get("datetime"))
     if when is None:
-        return FollowUpBucket.UPCOMING
+        # Required, pending, but the lead never named a time (spec S12).
+        return FollowUpBucket.UNSCHEDULED
 
     now = now or utcnow()
     if when < now:
@@ -72,14 +85,42 @@ def decorate_lead(lead: dict, now: datetime | None = None) -> dict:
     return lead
 
 
-def build_follow_up_block(when: datetime) -> dict:
+def sort_worklist(leads: list[dict]) -> list[dict]:
+    """Overdue -> due -> upcoming (each soonest first) -> unscheduled.
+
+    Mongo sorts null datetimes FIRST in ascending order, which would put
+    unscheduled leads at the top; this puts them where they belong.
+    """
+    far_future = datetime.max.replace(tzinfo=timezone.utc)
+
+    def key(lead: dict):
+        follow_up = lead.get("follow_up") or {}
+        bucket = follow_up.get("bucket") or compute_bucket(follow_up).value
+        when = _as_utc(follow_up.get("datetime")) or far_future
+        return (BUCKET_SORT_ORDER.get(bucket, 9), when)
+
+    return sorted(leads, key=key)
+
+
+def build_follow_up_block(
+    when: datetime | None,
+    reason: str | None = None,
+    date_str: str | None = None,
+    time_str: str | None = None,
+) -> dict:
+    """The lead's denormalized follow-up block.
+
+    `date`/`time` come from the analysis when present (they are in the lead's
+    local timezone); otherwise they are rendered from the UTC instant.
+    """
     when = _as_utc(when)
     return {
         "required": True,
-        "date": when.strftime("%Y-%m-%d"),
-        "time": when.strftime("%H:%M"),
+        "date": date_str or (when.strftime("%Y-%m-%d") if when else None),
+        "time": time_str or (when.strftime("%H:%M") if when else None),
         "datetime": when,
         "status": FollowUpStatus.PENDING.value,
+        "reason": reason,
     }
 
 
@@ -89,71 +130,75 @@ NO_FOLLOW_UP = {
     "time": None,
     "datetime": None,
     "status": None,
+    "reason": None,
 }
 
 
 # --------------------------------------------------------------------------
-# Analysis -> persistence
+# Analysis -> lead projection
 # --------------------------------------------------------------------------
 
 
-def apply_analysis(db: Database, call: dict, analysis: AnalysisResult) -> dict:
-    """Persist an analysis result.
+def follow_up_block_from_analysis(analysis: CallAnalysisResult) -> dict:
+    if analysis.follow_up_required:
+        fu = analysis.follow_up
+        return build_follow_up_block(
+            fu.datetime if fu else None,
+            reason=fu.reason if fu else None,
+            date_str=fu.date if fu else None,
+            time_str=fu.time if fu else None,
+        )
+    return dict(NO_FOLLOW_UP)
 
-    1. Upsert call_outcomes keyed on call_id -- this is what makes the process
-       endpoint idempotent: re-processing overwrites instead of duplicating.
-    2. Project the outcome onto the lead (status + follow-up block), but only
-       when this call is the lead's most recent call, so replaying an older
-       call cannot resurrect a stale follow-up.
+
+def is_latest_call(db: Database, lead_id: str, call: dict) -> bool:
+    """True unless a *processed* call for this lead ended after this one.
+
+    Only COMPLETED calls count: the guard exists to stop an older recording
+    overwriting a newer call's outcome, and an unprocessed or failed call has
+    no outcome to protect.
     """
-    now = utcnow()
-    lead_id = call["lead_id"]
-
-    if analysis.follow_up_required and analysis.follow_up_datetime:
-        follow_up = build_follow_up_block(analysis.follow_up_datetime)
-    else:
-        follow_up = dict(NO_FOLLOW_UP)
-
-    existing = db[CALL_OUTCOMES].find_one({"call_id": call["call_id"]})
-
-    outcome_doc = {
-        "call_id": call["call_id"],
-        "lead_id": lead_id,
-        "outcome": analysis.outcome.value,
-        "reason": analysis.reason,
-        "follow_up": follow_up,
-        "processed_at": now,
-        "analyzer": analysis.analyzer,
-        "confidence": analysis.confidence,
-    }
-    db[CALL_OUTCOMES].update_one(
-        {"call_id": call["call_id"]}, {"$set": outcome_doc}, upsert=True
-    )
-
-    applied = _is_latest_call(db, lead_id, call)
-    if applied:
-        lead_update = {
-            "lead_status": OUTCOME_TO_LEAD_STATUS[analysis.outcome].value,
-            "follow_up": follow_up,
-            "last_call_at": _as_utc(call.get("ended_at")),
-            "latest_call_id": call["call_id"],
-            "latest_outcome": analysis.outcome.value,
-            "updated_at": now,
+    this_ended = _as_utc(call.get("ended_at") or call.get("created_at"))
+    newer = db[CALLS].find_one(
+        {
+            "lead_id": lead_id,
+            "call_id": {"$ne": call["call_id"]},
+            "status": CallStatus.COMPLETED.value,
+            "ended_at": {"$gt": this_ended},
         }
-        db[LEADS].update_one({"lead_id": lead_id}, {"$set": lead_update})
-
-    lead = db[LEADS].find_one({"lead_id": lead_id})
-    return {
-        "outcome_doc": outcome_doc,
-        "lead": lead,
-        "already_processed": existing is not None,
-        "applied_to_lead": applied,
-    }
+    )
+    return newer is None
 
 
-def _is_latest_call(db: Database, lead_id: str, call: dict) -> bool:
-    latest = db[CALLS].find_one({"lead_id": lead_id}, sort=[("ended_at", -1)])
-    return latest is None or latest["call_id"] == call["call_id"]
+def apply_analysis_to_lead(
+    db: Database, call: dict, analysis: CallAnalysisResult, analysis_id: str
+) -> bool:
+    """Project a validated analysis onto the lead (spec S15).
+
+    Only applied when this call is the lead's most recent call, so replaying an
+    older recording cannot resurrect a stale follow-up. Returns whether the
+    lead was updated.
+    """
+    lead_id = call["lead_id"]
+    if not is_latest_call(db, lead_id, call):
+        return False
+
+    now = utcnow()
+    db[LEADS].update_one(
+        {"lead_id": lead_id},
+        {
+            "$set": {
+                "lead_status": OUTCOME_TO_LEAD_STATUS[analysis.outcome].value,
+                "follow_up": follow_up_block_from_analysis(analysis),
+                "last_call_at": _as_utc(call.get("ended_at")) or _as_utc(call.get("created_at")),
+                "latest_call_id": call["call_id"],
+                "latest_outcome": analysis.outcome.value,
+                "latest_analysis_id": analysis_id,
+                "updated_at": now,
+            }
+        },
+    )
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +231,7 @@ def apply_followup_action(db: Database, lead: dict, request: FollowUpActionReque
         lead_status = LeadStatus.CONTACTED.value
     else:  # RESCHEDULE
         new_datetime = _as_utc(request.new_datetime)
-        follow_up = build_follow_up_block(new_datetime)
+        follow_up = build_follow_up_block(new_datetime, reason=follow_up.get("reason"))
         lead_status = LeadStatus.FOLLOW_UP.value
 
     history_entry = {

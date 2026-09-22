@@ -4,7 +4,9 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.models.call import Call, CallOutcome, CallTranscript, Outcome
+from app.models.analysis import CallAnalysis
+from app.models.call import Call, CallStatus, CallTranscript, Outcome
+from app.models.caller import Caller
 from app.models.lead import (
     AssignedBD,
     FollowUp,
@@ -28,6 +30,7 @@ class LeadListItem(BaseModel):
     last_call_at: datetime | None = None
     latest_call_id: str | None = None
     latest_outcome: Outcome | None = None
+    latest_analysis_id: str | None = None
     updated_at: datetime
 
 
@@ -37,8 +40,9 @@ class LeadDetail(LeadListItem):
     created_at: datetime
     follow_up_history: list[FollowUpHistoryEntry] = Field(default_factory=list)
     latest_call: Call | None = None
+    latest_caller: Caller | None = None
     latest_transcript: CallTranscript | None = None
-    latest_call_outcome: CallOutcome | None = None
+    latest_analysis: CallAnalysis | None = None
 
 
 class DashboardSummary(BaseModel):
@@ -50,6 +54,7 @@ class DashboardSummary(BaseModel):
     dropped: int
     # Extra context, cheap to compute and useful on the cards.
     upcoming: int = 0
+    unscheduled: int = 0
     unprocessed_calls: int = 0
 
 
@@ -60,6 +65,20 @@ class FilterOptions(BaseModel):
     courses: list[str]
     outcomes: list[str]
     follow_up_statuses: list[str]
+
+
+class UIConfig(BaseModel):
+    """Non-secret settings the frontend needs. Nothing here is a credential."""
+
+    call_analyzer_enabled: bool
+    audio_storage_mode: str
+    audio_playback_enabled: bool
+    max_audio_mb: int
+    allowed_audio_types: list[str]
+    transcription_provider: str
+    analysis_model: str
+    vertex_configured: bool
+    analysis_fallback_enabled: bool
 
 
 class FollowUpActionRequest(BaseModel):
@@ -82,16 +101,60 @@ class FollowUpActionRequest(BaseModel):
         return self
 
 
+class CallFromUrlRequest(BaseModel):
+    audio_url: str
+    lead_id: str
+    caller_id: str
+
+
+class ValidateUrlRequest(BaseModel):
+    audio_url: str
+
+
+class ValidateUrlResponse(BaseModel):
+    url: str
+    reachable: bool
+    content_type: str | None = None
+    size_bytes: int | None = None
+    filename: str | None = None
+
+
+class CallCreatedResponse(BaseModel):
+    """Returned by /upload and /from-url. The next step is POST /process."""
+
+    call_id: str
+    lead_id: str
+    caller_id: str
+    source_type: str
+    status: CallStatus
+    duration_seconds: int | None = None
+    audio_bytes: int | None = None
+    audio_filename: str | None = None
+    message: str
+
+
+class CallStatusResponse(BaseModel):
+    call_id: str
+    status: CallStatus
+    error: str | None = None
+    failed_stage: CallStatus | None = None
+    transcript_id: str | None = None
+    analysis_id: str | None = None
+    processed_at: datetime | None = None
+
+
 class ProcessCallResponse(BaseModel):
     """Result of the 'call completed' processing flow."""
 
     call_id: str
     lead_id: str
-    outcome: Outcome
-    reason: str
-    follow_up: FollowUp
-    lead_status: LeadStatus
-    analyzer: str
-    already_processed: bool = False
-    applied_to_lead: bool = True
+    caller_id: str | None = None
+    status: CallStatus
+    outcome: Outcome | None = None
+    analysis: CallAnalysis | None = None
+    transcript: CallTranscript | None = None
+    follow_up: FollowUp | None = None
+    lead_status: LeadStatus | None = None
+    applied_to_lead: bool = False
+    degraded: bool = False
     message: str

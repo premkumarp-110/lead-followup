@@ -1,9 +1,9 @@
-import { badgeFor, formatDate, formatDateTime, formatTime, outcomeBadge } from './format.js'
+import { badgeFor, formatDate, formatDateTime, formatFollowUp, outcomeBadge } from './format.js'
 
 /**
  * Renders both dashboard tables.
- * variant="follow-up"     -> the active worklist, with follow-up columns + actions
- * variant="non-follow-up" -> converted / dropped / closed leads
+ * variant="follow-up" -> the active worklist, with follow-up columns + actions
+ * variant="closed"    -> converted / dropped / completed leads
  */
 export default function LeadTable({ variant, leads, loading, onSelectLead, onAction }) {
   const isFollowUp = variant === 'follow-up'
@@ -33,10 +33,9 @@ export default function LeadTable({ variant, leads, loading, onSelectLead, onAct
             <th>Last Call</th>
             {isFollowUp ? (
               <>
-                <th>Follow-up Date</th>
-                <th>Time</th>
+                <th>Follow-up</th>
                 <th>Status</th>
-                <th>Outcome</th>
+                <th>Reason</th>
                 <th>Action</th>
               </>
             ) : (
@@ -64,10 +63,9 @@ export default function LeadTable({ variant, leads, loading, onSelectLead, onAct
 
                 {isFollowUp ? (
                   <>
-                    <td>{formatDate(lead.follow_up?.datetime)}</td>
-                    <td>{formatTime(lead.follow_up?.datetime)}</td>
+                    <td className={lead.follow_up?.datetime ? '' : 'sub'}>{formatFollowUp(lead.follow_up)}</td>
                     <td><span className={`badge ${badge.cls}`}>{badge.label}</span></td>
-                    <td><span className={`badge ${outcome.cls}`}>{outcome.label}</span></td>
+                    <td className="reason-cell" title={lead.follow_up?.reason || ''}>{lead.follow_up?.reason || '—'}</td>
                     <td onClick={(e) => e.stopPropagation()}>
                       <div className="actions">
                         <button className="btn small" onClick={() => onAction(lead, 'COMPLETE')}>Mark Done</button>

@@ -131,3 +131,64 @@ tbody tr.row-clickable:hover { background: #f8fafc; cursor: pointer; }
   .kv { grid-template-columns: 1fr; gap: 2px 0; }
   .kv dd { margin-bottom: 8px; }
 }
+
+/* ---------- unscheduled bucket + warn banner ---------- */
+:root { --unscheduled-bg: #ede9fe; --unscheduled-fg: #6d28d9; --warn-bg: #fef3c7; --warn-fg: #92400e; }
+.badge.unscheduled { background: var(--unscheduled-bg); color: var(--unscheduled-fg); }
+.banner.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.reason-cell { max-width: 280px; white-space: normal; color: #334155; font-size: 13px; }
+
+/* ---------- call analyzer ---------- */
+.analyzer { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-bottom: 20px; }
+.analyzer-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.analyzer-head h2 { margin: 0 0 4px; font-size: 16px; text-transform: uppercase; letter-spacing: .06em; }
+.analyzer-head p { margin: 0; max-width: 640px; }
+.analyzer-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; }
+.panel { border: 1px solid var(--border); border-radius: 8px; padding: 14px; background: #fbfcfe; }
+.panel.outcome { margin-top: 14px; background: var(--surface); }
+
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
+.segmented button { font: inherit; padding: 7px 14px; border: none; background: #fff; cursor: pointer; color: var(--muted); }
+.segmented button + button { border-left: 1px solid var(--border); }
+.segmented button.active { background: var(--accent); color: #fff; }
+.segmented button:disabled { opacity: .5; cursor: not-allowed; }
+
+.dropzone { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 26px 16px; border: 2px dashed var(--border); border-radius: 8px; background: #fff; cursor: pointer; text-align: center; }
+.dropzone:hover { border-color: var(--accent); }
+.dropzone.disabled { opacity: .5; cursor: not-allowed; }
+.dropzone input { display: none; }
+
+.file-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: #fff; }
+.file-card.ok { border-color: var(--converted-fg); margin-top: 10px; }
+.file-icon { width: 36px; height: 36px; border-radius: 8px; background: var(--upcoming-bg); color: var(--upcoming-fg); display: grid; place-items: center; font-size: 18px; flex-shrink: 0; }
+.file-card.ok .file-icon { background: var(--converted-bg); color: var(--converted-fg); }
+.file-meta { flex: 1; min-width: 0; }
+.file-meta .lead-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.url-row { display: flex; gap: 8px; }
+.url-row input { min-width: 0; }
+
+.selection { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+.selection-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: #fff; }
+.analyze-btn { width: 100%; margin-top: 14px; padding: 10px 14px; font-weight: 600; }
+
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 22px; }
+.step { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.step.done { color: var(--converted-fg); }
+.step.active { color: var(--text); font-weight: 600; }
+.step.failed { color: var(--overdue-fg); font-weight: 600; flex-basis: 100%; flex-wrap: wrap; }
+.step-icon { width: 20px; text-align: center; }
+.step-error { flex-basis: 100%; font-weight: 400; margin-left: 28px; font-size: 13px; }
+
+.result { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+.result-title { font-weight: 600; color: var(--converted-fg); margin-bottom: 10px; }
+.result-kv { grid-template-columns: 140px 1fr; }
+.result-actions { display: flex; gap: 8px; margin-top: 14px; }
+.points { margin: 0; padding-left: 18px; }
+.points li { margin: 2px 0; }
+.audio-player audio { width: 100%; max-width: 480px; display: block; margin-bottom: 4px; }
+.modal.wide { max-width: 720px; }
+
+@media (max-width: 860px) {
+  .analyzer-grid { grid-template-columns: 1fr; }
+  .selection { grid-template-columns: 1fr; }
+}

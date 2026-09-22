@@ -3,8 +3,8 @@
 from fastapi import APIRouter, Depends
 from pymongo.database import Database
 
-from app.database import CALL_OUTCOMES, CALLS, LEADS, get_db
-from app.models.call import Outcome
+from app.database import CALLS, LEADS, get_db
+from app.models.call import CallStatus, Outcome
 from app.models.lead import FollowUpBucket, FollowUpStatus, LeadStatus
 from app.models.schemas import DashboardSummary, FilterOptions
 from app.routes.filters import LeadFilters, apply_bucket_filter, lead_filters
@@ -22,7 +22,7 @@ def get_summary(
     now = utcnow()
     docs = apply_bucket_filter(list(db[LEADS].find(filters.mongo_query())), filters, now)
 
-    counts = {"follow_up": 0, "due_today": 0, "overdue": 0, "upcoming": 0}
+    counts = {"follow_up": 0, "due_today": 0, "overdue": 0, "upcoming": 0, "unscheduled": 0}
     converted = dropped = 0
 
     for lead in docs:
@@ -43,9 +43,14 @@ def get_summary(
             elif bucket is FollowUpBucket.UPCOMING:
                 counts["upcoming"] += 1
                 counts["due_today"] += 1 if _is_today(follow_up, now) else 0
+            elif bucket is FollowUpBucket.UNSCHEDULED:
+                counts["unscheduled"] += 1
 
-    processed_call_ids = db[CALL_OUTCOMES].distinct("call_id")
-    unprocessed = db[CALLS].count_documents({"call_id": {"$nin": processed_call_ids}})
+    # Calls that were ingested but never finished processing. Not narrowed by
+    # the lead filters -- it is a pipeline indicator, not a lead count.
+    unprocessed = db[CALLS].count_documents(
+        {"status": {"$nin": [CallStatus.COMPLETED.value]}}
+    )
 
     return {
         "total_leads": len(docs),
@@ -55,6 +60,7 @@ def get_summary(
         "converted": converted,
         "dropped": dropped,
         "upcoming": counts["upcoming"],
+        "unscheduled": counts["unscheduled"],
         "unprocessed_calls": unprocessed,
     }
 

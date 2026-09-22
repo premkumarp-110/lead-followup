@@ -1,8 +1,18 @@
-# Environment
+# Environment -- never commit real configuration
 .env
 .env.local
 *.env
 !.env.example
+
+# Google Cloud credentials
+*service-account*.json
+*service_account*.json
+gcp-*.json
+credentials.json
+
+# Uploaded call recordings
+backend/uploads/*
+!backend/uploads/.gitkeep
 
 # Python
 __pycache__/

@@ -1,452 +1,373 @@
-# Lead Follow-up Management Dashboard
+# AI-Powered Lead Follow-up Management System
 
-An MVP dashboard that tells a BD (Business Development executive) **which leads they need to
-contact next**, derived from the outcome of each lead's most recent call.
+An internal tool for an EdTech BD team. After a BD finishes a call with a lead, they upload the
+recording (or paste its URL), pick the lead and the caller, and the system:
 
-After a call ends, its transcript is analyzed. The analysis produces one of three outcomes —
-`FOLLOW_UP_REQUIRED`, `CONVERTED` or `DROPPED` — which updates the lead and, in turn, the
-dashboard. Converted and dropped leads drop off the active worklist automatically.
+1. stores the call record,
+2. transcribes the audio,
+3. analyzes the conversation with **Vertex AI Gemini**,
+4. validates the structured result,
+5. decides the next action — `FOLLOW_UP_REQUIRED`, `CONVERTED` or `DROPPED`,
+6. updates the lead and the dashboard.
 
-> **No LLM or external API calls are made in this version.** Call analysis is deterministic
-> keyword/rule matching, deliberately placed behind the same interface a future LLM analyzer will
-> implement. There is no authentication and no LeadSquared integration, by design.
+Converted and dropped leads leave the active worklist automatically. Follow-ups are bucketed as
+Overdue / Due / Upcoming / Unscheduled on every read, so the "who do I call next?" list is never
+stale.
+
+> **Scope:** no authentication, no LeadSquared/WhatsApp/SMS/email, no queues, no vector DB. One
+> transcription call and one analysis call per recording. That is deliberate (spec §34).
 
 ---
 
-## 1. Project overview
+## 1. Stack
 
 | | |
 |---|---|
-| **Frontend** | React 18 + Vite, plain CSS, axios |
-| **Backend** | Python 3.11 + FastAPI + Pydantic v2, PyMongo (sync) |
-| **Database** | Local MongoDB, URL supplied via `.env` |
-| **Auth** | None (out of scope for the MVP) |
-
-What the dashboard shows:
-
-- **Summary cards** — Total Leads, Follow-ups Required, Due Today, Overdue, Converted, Dropped
-- **Follow-ups Required** tab — the active worklist, most overdue first, with Overdue / Due /
-  Upcoming badges and Mark Done / Reschedule / Cancel actions
-- **No Follow-up Needed** tab — converted, dropped and closed leads
-- **Filters** — search, BD, course, outcome, follow-up status, exact date, date range, and
-  All / Today / Overdue / Upcoming quick filters. They all combine (AND).
-- **Lead details modal** — lead info, latest call, follow-up, latest transcript, action history
+| Frontend | React 18 + Vite, plain CSS, axios — talks **only** to the FastAPI backend |
+| Backend | Python 3.11, FastAPI, Pydantic v2, PyMongo |
+| Database | MongoDB (local or `docker compose`) |
+| AI | Vertex AI Gemini via the Google Gen AI Python SDK (`google-genai`) |
+| Audio | ffprobe for duration; files stored locally or referenced by URL |
 
 ---
 
 ## 2. Architecture
 
 ```
-                 ┌──────────────────────────────┐
-                 │  React + Vite dashboard      │  :5173
-                 │  Dashboard / Tables / Modals │
-                 └───────────────┬──────────────┘
-                                 │  axios (VITE_API_BASE_URL)
-                 ┌───────────────▼──────────────┐
-                 │  FastAPI backend             │  :8000
-                 │                              │
-                 │  routes/leads.py             │  lists, detail, follow-up actions
-                 │  routes/calls.py             │  POST /api/calls/{id}/process
-                 │  routes/dashboard.py         │  summary + filter options
-                 │                              │
-                 │  services/call_analyzer.py   │  ◄── LLM SWAP POINT
-                 │  services/followup_service.py│  outcome → lead projection, buckets
-                 └───────────────┬──────────────┘
-                                 │  PyMongo
-                 ┌───────────────▼──────────────┐
-                 │  MongoDB (local)             │
-                 │  leads · calls               │
-                 │  call_transcripts            │
-                 │  call_outcomes               │
-                 └──────────────────────────────┘
+ React dashboard (:5173)
+   └─ axios ─► FastAPI (:8000)
+                 routes/calls.py ─────► services/audio_service.py          validate · store · ffprobe
+                                  ─────► services/call_analysis_service.py  ORCHESTRATOR
+                                            ├─► transcription_service.py    audio → text      (Gemini, Vertex)
+                                            ├─► llm_service.py              text → decision   (Gemini, Vertex)
+                                            └─► followup_service.py         decision → lead
+                 routes/leads.py, dashboard.py, callers.py
+                 └─ PyMongo ─► leads · callers · calls · call_transcripts · call_analyses
 ```
 
-**Call analysis is a separate flow, not part of the call record.** Storing a call, storing its
-transcript, and analyzing that transcript are three distinct steps. Analysis is triggered
-explicitly by `POST /api/calls/{call_id}/process`, which is where a future "call completed" worker
-or webhook will call in.
+Each arrow is a module boundary. `call_analysis_service.py` is the only file that knows the
+order of the steps; moving processing to a background worker later means calling
+`process_call()` from the worker instead of the request handler. Swapping the LLM touches
+`llm_service.py` only.
 
 ### Collections
 
-| Collection | Key fields |
+| Collection | Purpose |
 |---|---|
-| `leads` | `lead_id`, `name`, `phone`, `email`, `course`, `assigned_bd{id,name}`, `lead_status`, `follow_up{…}`, `follow_up_history[]`, `last_call_at`, `latest_call_id`, `latest_outcome` |
-| `calls` | `call_id`, `lead_id`, `started_at`, `ended_at`, `duration_seconds`, `transcript_id`, `status` |
-| `call_transcripts` | `transcript_id`, `call_id`, `lead_id`, `transcript`, `created_at` |
-| `call_outcomes` | `call_id` (unique), `lead_id`, `outcome`, `reason`, `follow_up{…}`, `processed_at`, `analyzer`, `confidence` |
+| `leads` | Lead master + a denormalized `follow_up` block copied from the latest analysis |
+| `callers` | BD executives who make calls (`caller_id`, name, role) |
+| `calls` | One per recording: `source_type` (UPLOAD/URL), audio metadata, processing `status`, `transcript_id`, `analysis_id` |
+| `call_transcripts` | Transcript text, language, provider — separate from the call |
+| `call_analyses` | Every analysis attempt: outcome, follow-up, intent, summary, key points, confidence, `raw_response`, `status`, `degraded` |
 
-`call_outcomes` is the source of truth for an analysis result. The `follow_up` block on the lead is
-a denormalized copy of the latest outcome, so the dashboard's main query is a single indexed find
-instead of a join.
+Call statuses: `UPLOADED → PROCESSING → TRANSCRIBING → ANALYZING → COMPLETED` or `FAILED`
+(with `error` and `failed_stage`). The orchestrator writes each transition, so the UI stepper
+polls real state.
 
-### Stored vs. derived follow-up state
-
-`follow_up.status` stores only durable state: **PENDING**, **COMPLETED**, **CANCELLED**.
-
-The time-sensitive bucket is **computed on every read** from `follow_up.datetime` vs. now, so it
-can never go stale in the database:
+### Follow-up buckets (derived on every read, never stored)
 
 | Bucket | Rule |
 |---|---|
-| `OVERDUE` | follow-up time is in the past and still PENDING |
-| `DUE` | follow-up time is today and within the next 2 hours |
-| `UPCOMING` | follow-up time is in the future, outside the due window |
+| `OVERDUE` | follow-up datetime is in the past and status is `PENDING` |
+| `DUE` | today and within the next 2 hours |
+| `UPCOMING` | in the future, outside the due window |
+| `UNSCHEDULED` | follow-up required but the lead never gave a date (`datetime: null`) |
 | `COMPLETED` / `CANCELLED` | from the stored status |
 
-It is returned to the frontend as `follow_up.bucket`. All datetimes are stored as timezone-aware
-UTC; the browser formats them in local time.
+`UNSCHEDULED` exists because the analyzer must **never invent a date** (§12). Those leads still
+need action, so they stay on the worklist — sorted last.
+
+### When Gemini fails
+
+If Vertex is unreachable, misconfigured, or returns JSON that fails validation after one repair
+retry:
+
+1. A `call_analyses` document with `status: FAILED` and the full `raw_response` is written
+   (debugging trail, §13).
+2. If `ANALYSIS_FALLBACK_ENABLED=true` (default), the deterministic keyword analyzer runs and
+   writes a second document with `status: COMPLETED`, `degraded: true`,
+   `model: keyword-fallback-v1`. This one updates the lead, and the UI shows a "fallback" notice.
+3. With `ANALYSIS_FALLBACK_ENABLED=false`, the call is marked `FAILED` and the lead is untouched.
+
+Transcription has no equivalent fallback — without Vertex, uploaded audio cannot become text and
+the call fails at the `TRANSCRIBING` step with a message naming the missing setting.
 
 ---
 
 ## 3. Prerequisites
 
-- Python 3.11+
-- Node.js 18+ and npm
-- MongoDB running locally (no auth needed for the MVP)
+- Python 3.11+, Node.js 18+, MongoDB running locally
+- `ffmpeg` (for `ffprobe`) — `sudo apt install ffmpeg`
+- A Google Cloud project with **Vertex AI API** enabled and credentials with the
+  **Vertex AI User** role (see §5)
 
 ---
 
-## 4. MongoDB setup
-
-Make sure a local `mongod` is running and reachable:
+## 4. Install
 
 ```bash
-sudo systemctl start mongod      # or: mongod --dbpath /your/data/path
-mongosh --eval 'db.runCommand({ping: 1})'
-```
-
-The database (`lead_followup_db` by default) is created automatically on first seed. If MongoDB is
-unreachable, the backend fails at startup with a clear message rather than erroring per request.
-
----
-
-## 5. `.env` setup
-
-The MongoDB URL is **never hardcoded**. Copy the examples and edit if needed:
-
-```bash
-cp backend/.env.example backend/.env
-cp frontend/.env.example frontend/.env
-```
-
-`backend/.env`:
-
-```
-MONGODB_URL=mongodb://localhost:27017
-DATABASE_NAME=lead_followup_db
-ANALYZER_BACKEND=keyword
-CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-```
-
-`frontend/.env`:
-
-```
-VITE_API_BASE_URL=http://localhost:8000
-```
-
-`.env` is gitignored; only `.env.example` is committed.
-
----
-
-## 6. Backend installation
-
-```bash
+# backend
 cd backend
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
+cp .env.example .env            # then edit -- see next section
 
----
-
-## 7. Frontend installation
-
-```bash
-cd frontend
+# frontend
+cd ../frontend
 npm install
+cp .env.example .env
 ```
 
 ---
 
-## 8. Seed sample data
+## 5. Configure Google Cloud (Vertex AI)
+
+**Enable the API** (the only one needed — no Cloud Storage, no Speech-to-Text):
 
 ```bash
-cd backend
-python seed.py
+gcloud services enable aiplatform.googleapis.com --project=<PROJECT_ID>
 ```
 
-This drops and recreates the four collections, then inserts **15 leads, 17 calls and 17
-transcripts** and runs the *real* analyzer over them — the dashboard you see is produced by
-`services/call_analyzer.py`, not by hardcoded outcomes.
+**Grant the role** to whichever identity the backend runs as:
+`roles/aiplatform.user` (Vertex AI User). Billing must be enabled on the project.
 
-Follow-up times are generated **relative to now**, so Due Today / Overdue / Upcoming are always
-populated whenever you reseed:
+**Authenticate** — either:
 
-| Segment | Count |
+```bash
+gcloud auth application-default login          # Application Default Credentials
+```
+
+and leave `GOOGLE_APPLICATION_CREDENTIALS` blank, **or** download a service-account key and set
+`GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json`. The key is gitignored; never commit it.
+
+**Fill `backend/.env`:**
+
+```ini
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_LOCATION=us-central1        # or global / asia-south1
+VERTEX_AI_MODEL=gemini-2.5-flash         # or gemini-2.5-pro
+```
+
+Everything else in `.env.example` has a working default. `GET /api/health` reports
+`vertex_configured` so you can confirm the backend sees the settings.
+
+### All environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CALL_ANALYZER_ENABLED` | `false` | Shows/hides the "Analyze New Call" section and enables its endpoints (upload, URL, process). Off by default; the dashboard runs read-only over seeded data until set to `true` |
+| `MONGODB_URL` | — (required) | Mongo connection string |
+| `DATABASE_NAME` | — (required) | Database name |
+| `GOOGLE_CLOUD_PROJECT` | blank | GCP project with Vertex AI enabled |
+| `GOOGLE_CLOUD_LOCATION` | `us-central1` | Vertex region or `global` |
+| `VERTEX_AI_MODEL` | `gemini-2.5-flash` | Gemini model id |
+| `GOOGLE_APPLICATION_CREDENTIALS` | blank (ADC) | Path to a service-account key |
+| `TRANSCRIPTION_PROVIDER` | `vertex` | `vertex` implemented; `local`, `gcp-stt` raise a clear not-configured error |
+| `ANALYSIS_FALLBACK_ENABLED` | `true` | Keyword fallback when Gemini fails |
+| `AUDIO_STORAGE_MODE` | `local` | `local` stores uploads; `url` disables uploads, URL input only |
+| `AUDIO_PLAYBACK_ENABLED` | `true` | Show the audio player in the modal |
+| `AUDIO_UPLOAD_DIR` | `uploads` | Where uploads are written (relative to `backend/`) |
+| `MAX_AUDIO_MB` | `20` | Upload cap — Gemini's inline-audio limit |
+| `ALLOWED_AUDIO_TYPES` | `mp3,wav,m4a,ogg,webm` | Accepted extensions |
+| `CORS_ORIGINS` | localhost:5173 | Allowed browser origins |
+
+The frontend has one variable: `VITE_API_BASE_URL=http://localhost:8000`. No credential ever
+reaches the browser; the UI reads non-secret flags from `GET /api/config`.
+
+---
+
+## 6. Seed sample data
+
+```bash
+cd backend && python seed.py
+```
+
+Drops and recreates all five collections, then inserts **15 leads, 5 callers, 17 calls,
+17 transcripts and 17 analyses**. Analyses are pre-baked (`model: "seed"`) so reseeding makes no
+API calls. Follow-up times are relative to now, so every bucket is always populated:
+
+| Segment | Leads |
 |---|---|
-| Overdue follow-ups | 3 |
+| Overdue | 3 |
 | Due today | 2 |
-| Upcoming follow-ups | 3 |
+| Upcoming | 3 |
+| Unscheduled (follow-up, no date) | 1 |
 | Converted | 3 |
 | Dropped | 2 |
-| New leads, call **left unprocessed** | 2 |
+| New, no calls yet | 1 — **Sandhya Rajan (L015)**, the demo target |
 
-The last two exist so you can demo the processing flow live — the seed prints the exact curl
-commands for them.
+Seeded calls have transcripts but no audio file; the modal says so.
 
 ---
 
-## 9. Start the backend
+## 7. Run
 
 ```bash
-cd backend
-uvicorn app.main:app --reload
+# terminal 1
+cd backend && source .venv/bin/activate && uvicorn app.main:app --reload
+# terminal 2
+cd frontend && npm run dev
 ```
 
-- API: http://localhost:8000
-- Interactive docs: http://localhost:8000/docs
-- Health: http://localhost:8000/api/health
+Backend: http://localhost:8000 (docs at `/docs`). Frontend: http://localhost:5173.
 
----
-
-## 10. Start the frontend
+Or with Docker:
 
 ```bash
-cd frontend
-npm run dev
+cp .env.example .env    # fill GOOGLE_CLOUD_PROJECT and the service-account path
+docker compose up --build
 ```
-
-Open http://localhost:5173.
 
 ---
 
-## 11. API endpoints
+## 8. Using the dashboard
+
+**Analyze New Call** (top of the page) — only shown when `CALL_ANALYZER_ENABLED=true` in
+`backend/.env`. With it unset or `false`, the section is hidden and its four endpoints
+(`/upload`, `/validate-url`, `/from-url`, `/{id}/process`) return `403`; everything else
+(dashboard, tables, filters, the lead details modal, history already on disk) keeps working:
+
+1. **Upload Audio** (default) — choose an mp3/wav/m4a/ogg/webm up to 20 MB. Filename, size and
+   duration are shown; unsupported types are rejected before upload. Or switch to **Audio URL**,
+   paste a link and click **Validate Audio URL** — the backend checks the scheme, refuses
+   private/loopback hosts, and confirms the content type and size without downloading.
+2. Select the **Lead** and the **Caller / BD**. Both are required; the button stays disabled
+   until then.
+3. **Analyze Call.** The stepper shows real pipeline state:
+   `✓ Audio uploaded → ⏳ Transcribing → Analyzing → Updating lead → ✓ Completed`.
+4. The result panel shows outcome, follow-up date/time, reason, customer intent, confidence,
+   summary, key points, and the transcript. The tables refresh automatically.
+
+**Summary cards** (Total / Follow-ups / Due Today / Overdue / Converted / Dropped) and **quick
+filters** (All / Due Today / Overdue / Upcoming / Unscheduled / Converted / Dropped) combine with
+the search, BD, course, outcome, status and date filters (AND).
+
+**Tabs:** *Leads Requiring Follow-up* (Lead · Course · BD · Last Call · Follow-up · Status ·
+Reason · Actions) and *Completed / Closed* (converted, dropped, completed, cancelled).
+
+**Click a lead** for the modal: lead details, latest call (date, caller, duration, source,
+processing status, audio player), AI analysis (outcome, intent, confidence, summary, key points),
+follow-up (required, date, time, status, reason), full transcript, and action history.
+
+---
+
+## 9. API
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| GET | `/api/leads` | All leads (filterable) |
-| GET | `/api/leads/follow-ups` | Leads that require follow-up (required + PENDING), overdue first |
-| GET | `/api/leads/non-follow-ups` | Converted / dropped / closed leads |
-| GET | `/api/leads/{lead_id}` | Lead detail incl. latest call, transcript and outcome |
-| GET | `/api/leads/{lead_id}/calls` | All calls for a lead |
-| GET | `/api/leads/{lead_id}/transcript/latest` | Latest transcript |
-| GET | `/api/leads/{lead_id}/outcome` | Latest call outcome |
-| PATCH | `/api/leads/{lead_id}/follow-up` | Mark done / cancel / reschedule (reason required) |
-| GET | `/api/calls` | All calls (optional `?lead_id=`) |
-| GET | `/api/calls/{call_id}` | One call |
-| GET | `/api/calls/{call_id}/transcript` | That call's transcript |
-| GET | `/api/calls/{call_id}/outcome` | That call's outcome |
-| **POST** | **`/api/calls/{call_id}/process`** | **Analyze the transcript and update the lead** |
-| GET | `/api/dashboard/summary` | Summary card counts |
-| GET | `/api/dashboard/filters` | Distinct BDs / courses for the filter dropdowns |
-| GET | `/api/health` | Liveness + DB check |
+| GET | `/api/leads` | All leads, filterable |
+| GET | `/api/leads/follow-ups` | Active worklist: overdue → due → upcoming → unscheduled |
+| GET | `/api/leads/closed` | Converted / dropped / completed / cancelled |
+| GET | `/api/leads/{id}` | Lead + latest call, caller, transcript, analysis |
+| GET | `/api/leads/{id}/calls` | All calls for the lead |
+| GET | `/api/leads/{id}/latest-transcript` | Latest transcript |
+| GET | `/api/leads/{id}/latest-analysis` | Latest completed analysis |
+| PATCH | `/api/leads/{id}/follow-up` | `COMPLETE` / `CANCEL` / `RESCHEDULE` (reason required) |
+| GET | `/api/callers` | BD list for the dropdown |
+| POST | `/api/calls/upload` | multipart: `file`, `lead_id`, `caller_id` → call record |
+| POST | `/api/calls/validate-url` | `{audio_url}` → reachability + content type + size |
+| POST | `/api/calls/from-url` | `{audio_url, lead_id, caller_id}` → call record |
+| POST | `/api/calls/{id}/process` | Transcribe → analyze → validate → store → update lead |
+| GET | `/api/calls/{id}/status` | Poll target for the stepper |
+| GET | `/api/calls/{id}` · `/transcript` · `/analysis` · `/analyses` | Call reads (`/analyses` includes failed attempts) |
+| GET | `/api/calls/{id}/audio` | Streams the recording by call id (never a path); 404 when playback is disabled |
+| GET | `/api/dashboard/summary` · `/filters` | Card counts, dropdown options |
+| GET | `/api/config` · `/api/health` | Non-secret UI flags; liveness + `vertex_configured` |
 
-### Filter query parameters
-
-Supported on `/api/leads`, `/api/leads/follow-ups`, `/api/leads/non-follow-ups` and
-`/api/dashboard/summary`, and they combine with AND:
-
-| Param | Example |
-|---|---|
-| `search` | `?search=divya` (name, email, phone or lead id) |
-| `bd` | `?bd=Rahul` |
-| `course` | `?course=Data Science` |
-| `outcome` | `?outcome=CONVERTED` |
-| `status` | `?status=PENDING` (also accepts `OVERDUE`) |
-| `date` | `?date=2026-09-22` |
-| `date_from` / `date_to` | `?date_from=2026-09-21&date_to=2026-09-28` |
-| `bucket` | `?bucket=ALL\|OVERDUE\|DUE\|DUE_TODAY\|UPCOMING\|COMPLETED\|CANCELLED` |
+Filter params on the list endpoints and the summary: `search`, `bd`, `course`, `outcome`,
+`status`, `date`, `date_from`, `date_to`,
+`bucket=ALL|OVERDUE|DUE|DUE_TODAY|UPCOMING|UNSCHEDULED|COMPLETED|CANCELLED|CONVERTED|DROPPED`.
 
 ```bash
-# "Rahul's overdue leads"
+# Rahul's overdue leads
 curl "http://localhost:8000/api/leads/follow-ups?bd=Rahul&bucket=OVERDUE"
-```
 
-### Follow-up actions
-
-Every action requires a `reason`, which is appended to the lead's `follow_up_history`:
-
-```bash
-curl -X PATCH http://localhost:8000/api/leads/L004/follow-up \
-  -H 'Content-Type: application/json' \
-  -d '{"action":"COMPLETE","reason":"Spoke to the lead; demo session booked."}'
-
-curl -X PATCH http://localhost:8000/api/leads/L001/follow-up \
-  -H 'Content-Type: application/json' \
-  -d '{"action":"RESCHEDULE","reason":"Lead was travelling.","new_datetime":"2026-09-24T09:30:00Z"}'
-
-curl -X PATCH http://localhost:8000/api/leads/L008/follow-up \
-  -H 'Content-Type: application/json' \
-  -d '{"action":"CANCEL","reason":"Duplicate lead; handled under L006."}'
-```
-
-`COMPLETE` and `CANCEL` remove the lead from the active worklist; `RESCHEDULE` keeps it PENDING at
-the new time.
-
----
-
-## 12. Example call-processing flow
-
-The seed leaves two calls unprocessed on purpose. Pick one (e.g. `CALL016`, lead `L014`):
-
-```bash
-# 1. Before: the lead is NOT on the follow-up list
-curl -s "http://localhost:8000/api/dashboard/summary"
-# → {"total_leads":15,"follow_ups_required":8, ... ,"unprocessed_calls":2}
-
-# 2. "Call completed" -> analyze the transcript
-curl -X POST http://localhost:8000/api/calls/CALL016/process
-```
-
-```json
-{
-  "call_id": "CALL016",
-  "lead_id": "L014",
-  "outcome": "FOLLOW_UP_REQUIRED",
-  "reason": "Lead asked to be contacted again (\"call me on\"). Callback scheduled for 22 Sep 2026 22:14 UTC.",
-  "follow_up": { "required": true, "date": "2026-09-22", "time": "22:14", "status": "PENDING" },
-  "lead_status": "FOLLOW_UP",
-  "analyzer": "keyword-v1",
-  "already_processed": false,
-  "message": "Call processed and lead updated."
-}
-```
-
-```bash
-# 3. After: the lead now appears on the dashboard
-curl -s "http://localhost:8000/api/dashboard/summary"
-# → follow_ups_required is now 9, unprocessed_calls is now 1
-```
-
-What the endpoint does:
-
-1. Loads the call (404 if unknown).
-2. Loads its transcript (422 if the call has no transcript yet).
-3. Passes the transcript to the configured analyzer.
-4. Upserts `call_outcomes` keyed on `call_id`.
-5. Updates the lead's `lead_status` and `follow_up` block.
-6. `FOLLOW_UP_REQUIRED` → status `FOLLOW_UP` + follow-up date/time, status `PENDING`.
-   `CONVERTED` → status `CONVERTED`, no follow-up. `DROPPED` → status `DROPPED`, no follow-up.
-
-**Idempotency:** `call_outcomes.call_id` is uniquely indexed, so re-posting the same call
-overwrites the outcome instead of creating a duplicate and returns `already_processed: true`.
-A lead is only updated from its *most recent* call, so replaying an older call cannot resurrect a
-stale follow-up.
-
-### Deterministic analysis rules (MVP)
-
-Evaluated in order — **DROPPED → CONVERTED → FOLLOW_UP → fallback** — so
-*"I paid for another course, not interested in this one"* resolves to DROPPED.
-
-| Outcome | Phrases |
-|---|---|
-| `DROPPED` | not interested, no longer interested, not interested anymore, don't want the course, please don't call, don't contact me, cancel |
-| `CONVERTED` | i want to enroll, i have completed the payment, payment completed, i want to proceed, i have registered, decided to join, send me the enrollment details |
-| `FOLLOW_UP_REQUIRED` | call me tomorrow, call me later, call me next week, contact me tomorrow, follow up tomorrow, get back to me, i will discuss and let you know, please call again, call me on/at/back |
-
-No phrase matched → `FOLLOW_UP_REQUIRED` with low `confidence`, so a lead is never silently lost.
-
-Date/time extraction is intentionally simple (explicit dates like `22 Sep 2026` or `2026-09-22`,
-clock times like `11 AM` / `2:30 pm` / `14:00`, and the keywords `tomorrow` / `day after tomorrow`
-/ `next week`) resolved against the call's `ended_at`. Building a real natural-language date parser
-is the LLM's job, not the MVP's.
-
-Check the rules against the spec's sample transcripts at any time:
-
-```bash
-cd backend && python check_analyzer.py
+# Full flow from the command line
+curl -F file=@call.mp3 -F lead_id=L015 -F caller_id=BD003 http://localhost:8000/api/calls/upload
+curl -X POST http://localhost:8000/api/calls/CALL-XXXXXXXX/process
 ```
 
 ---
 
-## 13. Future LLM integration
+## 10. The analysis contract
 
-```
-Call completed → Transcript stored → Call Analysis Worker → LLM → structured JSON
-        → call_outcomes → lead updated → dashboard reflects it automatically
-```
-
-Everything downstream of analysis already exists. The only piece to replace is the analyzer.
-`app/services/call_analyzer.py` defines the contract:
-
-```python
-class AnalysisResult(BaseModel):
-    outcome: Outcome                      # FOLLOW_UP_REQUIRED | CONVERTED | DROPPED
-    reason: str
-    follow_up_required: bool = False
-    follow_up_datetime: datetime | None = None
-    analyzer: str = "keyword-v1"
-    confidence: float = 1.0
-
-class CallAnalyzer(Protocol):
-    name: str
-    def analyze_call(self, transcript: str, *, context: dict | None = None) -> AnalysisResult: ...
-```
-
-That shape is deliberately identical to the JSON an LLM will return:
+Gemini is asked for exactly this JSON and the response is validated by
+`backend/app/models/analysis.py::CallAnalysisResult` before anything is stored:
 
 ```json
 {
   "outcome": "FOLLOW_UP_REQUIRED",
-  "reason": "Lead requested a callback after discussing the course with parents.",
   "follow_up_required": true,
-  "follow_up_datetime": "2026-09-22T11:00:00Z"
+  "follow_up": {
+    "date": "2026-09-23", "time": "11:00",
+    "datetime": "2026-09-23T11:00:00+05:30",
+    "reason": "Lead requested a callback after discussing the course with parents."
+  },
+  "customer_intent": "INTERESTED",
+  "summary": "Lead is interested but wants to discuss the course with family.",
+  "key_points": ["Interested in Full Stack Development", "Needs to discuss fees with parents"],
+  "confidence": 0.94
 }
 ```
 
-**To plug in an LLM:**
+Rules enforced by the prompt **and** the validator: `outcome` must be one of the three values
+(anything else fails validation); `CONVERTED`/`DROPPED` force `follow_up = null`; a required
+follow-up with no inferable date gets `datetime: null` and the reason
+*"Lead requested follow-up but did not specify a date/time."*; relative phrases ("tomorrow",
+"next week") resolve against the call's timestamp in Asia/Kolkata; dates are never invented.
 
-1. Add `app/services/llm_call_analyzer.py` with an `LLMCallAnalyzer` class implementing
-   `analyze_call` (call the model, parse its JSON into `AnalysisResult`).
-2. Register it in the `_ANALYZERS` registry in `call_analyzer.py`:
-   `_ANALYZERS = {"keyword": KeywordCallAnalyzer, "llm": LLMCallAnalyzer}`
-3. Set `ANALYZER_BACKEND=llm` in `backend/.env`.
+---
 
-No route, service, schema or frontend change is required. Routes only ever call `get_analyzer()`,
-never a concrete class, and each outcome records which analyzer produced it in
-`call_outcomes.analyzer` so keyword- and LLM-derived results stay distinguishable.
+## 11. Error handling
 
-Running the analysis asynchronously later (queue or background worker) means calling the same
-`analyze_call` + `followup_service.apply_analysis` pair from the worker instead of from the
-request; the persistence and dashboard layers are unchanged.
+Every failure returns `{"detail": "<readable message>"}`, never a stack trace:
+
+| Situation | Response |
+|---|---|
+| Unsupported type, too large, empty file, bad/private URL | `422` |
+| Unknown lead or caller | `404` |
+| Call already processing | `409` |
+| Transcription or Vertex failure | `503`, call marked `FAILED` with `failed_stage` |
+| Invalid LLM JSON after retry | `FAILED` analysis stored with `raw_response`; fallback or `503` |
+| MongoDB unreachable | startup refuses; per-request `503` |
+| Missing `MONGODB_URL` | startup refuses with instructions |
+| Missing Vertex settings | boots, warns, AI routes return `503` naming the setting |
+
+---
+
+## 12. Regression check
+
+```bash
+cd backend && python check_analyzer.py     # 11 cases, no network
+```
+
+Covers the spec's five sample transcripts (follow-up with date, converted, dropped, follow-up
+without date, payment follow-up) plus edge cases, against the fallback analyzer.
 
 ---
 
 ## Project structure
 
 ```
-.
-├── backend/
-│   ├── app/
-│   │   ├── main.py                 FastAPI app, CORS, lifespan, error handlers
-│   │   ├── config.py               .env-driven settings (no hardcoded URLs)
-│   │   ├── database.py             MongoClient, collections, indexes
-│   │   ├── models/                 lead.py, call.py, schemas.py
-│   │   ├── routes/                 leads.py, calls.py, dashboard.py, filters.py
-│   │   └── services/
-│   │       ├── call_analyzer.py    ← deterministic today, LLM later
-│   │       └── followup_service.py outcome → lead projection, buckets, actions
-│   ├── seed.py                     sample data + runs the real analysis flow
-│   ├── check_analyzer.py           analyzer sanity check
-│   ├── requirements.txt
-│   └── .env.example
-├── frontend/
-│   ├── src/
-│   │   ├── components/             Dashboard, SummaryCards, FilterBar, LeadTable,
-│   │   │                           LeadDetailsModal, FollowUpActionModal, format.js
-│   │   ├── services/api.js
-│   │   ├── App.jsx, main.jsx, index.css
-│   ├── package.json, vite.config.js, .env.example
-├── MODULES.md                      build progress tracker
-├── .env.example
-└── README.md
+backend/
+  app/
+    main.py                       app, CORS, error handlers, /api/health, /api/config
+    config.py                     .env settings; vertex_config_error()
+    database.py                   MongoClient, collection names, indexes
+    models/   lead.py · caller.py · call.py · analysis.py · schemas.py
+    routes/   leads.py · calls.py · callers.py · dashboard.py · filters.py
+    services/
+      audio_service.py            validation, storage, ffprobe, SSRF guard
+      transcription_service.py    provider registry; VertexGeminiTranscriber
+      llm_service.py              Gemini prompt + validation + repair retry + fallback
+      call_analyzer.py            deterministic keyword fallback
+      call_analysis_service.py    pipeline orchestrator + status transitions
+      followup_service.py         buckets, lead projection, BD actions
+      vertex_client.py            shared google-genai client + error wording
+  seed.py · check_analyzer.py · requirements.txt · Dockerfile · .env.example · uploads/
+frontend/
+  src/components/  CallAnalyzer · ProcessingSteps · AudioPlayer · Dashboard · SummaryCards ·
+                   FilterBar · LeadTable · LeadDetailsModal · FollowUpActionModal · format.js
+  src/services/api.js · App.jsx · main.jsx · index.css · Dockerfile · .env.example
+docker-compose.yml · .env.example · .gitignore · CLAUDE.md · MODULES.md
 ```
-
-## Notes and limitations (MVP)
-
-- No authentication, no LeadSquared integration, no audio/speech-to-text, no notifications.
-- `unprocessed_calls` in the summary is a global pipeline indicator and is not narrowed by the
-  lead filters.
-- The `DUE` window is fixed at 2 hours (`DUE_WINDOW` in `followup_service.py`).
-- Dashboard data refreshes on filter change or via the Refresh button; there is no polling or
-  websocket push.

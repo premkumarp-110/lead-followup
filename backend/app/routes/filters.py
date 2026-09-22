@@ -62,6 +62,12 @@ class LeadFilters:
         if self.outcome:
             clauses.append({"latest_outcome": self.outcome.value})
 
+        # CONVERTED / DROPPED quick filters select on lead_status, which Mongo
+        # can evaluate directly; the other bucket values are derived in Python.
+        quick = (self.bucket or "").strip().upper()
+        if quick in {"CONVERTED", "DROPPED"}:
+            clauses.append({"lead_status": quick})
+
         # OVERDUE is a derived bucket, not a stored status -- route it there.
         if self.status and self.status is not FollowUpStatus.OVERDUE:
             clauses.append({"follow_up.status": self.status.value})
@@ -98,14 +104,20 @@ class LeadFilters:
                 "DUE_TODAY": {FollowUpBucket.DUE.value, FollowUpBucket.OVERDUE.value},
                 "TODAY": {FollowUpBucket.DUE.value, FollowUpBucket.OVERDUE.value},
                 "UPCOMING": {FollowUpBucket.UPCOMING.value},
+                "UNSCHEDULED": {FollowUpBucket.UNSCHEDULED.value},
                 "COMPLETED": {FollowUpBucket.COMPLETED.value},
                 "CANCELLED": {FollowUpBucket.CANCELLED.value},
+                # Outcome-style quick filters: these leads have no follow-up
+                # bucket, so they are matched on lead_status instead (see
+                # `mongo_query`). Listed here so the value validates.
+                "CONVERTED": set(),
+                "DROPPED": set(),
             }
             if raw not in mapping:
                 # Mirrors Pydantic's 422 style for an unknown enum value.
                 raise ValueError(
-                    f"Invalid bucket '{self.bucket}'. Expected one of: "
-                    "ALL, OVERDUE, DUE, DUE_TODAY, UPCOMING, COMPLETED, CANCELLED."
+                    f"Invalid bucket '{self.bucket}'. Expected one of: ALL, OVERDUE, DUE, "
+                    "DUE_TODAY, UPCOMING, UNSCHEDULED, COMPLETED, CANCELLED, CONVERTED, DROPPED."
                 )
             wanted |= mapping[raw]
 
@@ -125,7 +137,9 @@ def lead_filters(
     date_from: DateOnly | None = Query(None),
     date_to: DateOnly | None = Query(None),
     bucket: str | None = Query(
-        None, description="ALL | OVERDUE | DUE | DUE_TODAY | UPCOMING | COMPLETED | CANCELLED"
+        None,
+        description="ALL | OVERDUE | DUE | DUE_TODAY | UPCOMING | UNSCHEDULED | COMPLETED | "
+        "CANCELLED | CONVERTED | DROPPED",
     ),
 ) -> LeadFilters:
     return LeadFilters(

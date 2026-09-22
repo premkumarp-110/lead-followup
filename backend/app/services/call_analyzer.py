@@ -1,86 +1,49 @@
-"""Call analysis service -- THE LLM SWAP POINT.
+"""Deterministic keyword analyzer -- the FALLBACK when Gemini is unavailable.
 
-Today this is a deterministic keyword analyzer. Tomorrow an LLM implementation
-takes its place. Everything downstream (routes, services, dashboard) depends
-only on:
+The primary analysis path is Vertex AI Gemini in `llm_service.py`. This module
+exists so the pipeline can still complete (clearly flagged as `degraded`) when
+Vertex is unreachable, misconfigured, or returns output that fails validation.
 
-    AnalysisResult          -- the structured output contract
-    CallAnalyzer            -- the one-method interface
-    get_analyzer()          -- returns the configured implementation
+It produces the same `CallAnalysisResult` contract as the LLM, so nothing
+downstream can tell the two apart except by the `model` / `degraded` fields on
+the stored analysis. It makes no network calls.
 
-To plug in an LLM later:
+Rule order is DROPPED -> CONVERTED -> FOLLOW_UP -> fallback, and that order is
+load-bearing: "I paid for another course, not interested in this one" must
+resolve to DROPPED.
 
-    1. Add app/services/llm_call_analyzer.py with:
-
-           class LLMCallAnalyzer:
-               name = "llm-gpt-x"
-               def analyze_call(self, transcript, *, context=None) -> AnalysisResult:
-                   ...call the model, parse its JSON into AnalysisResult...
-
-    2. Register it in _ANALYZERS below.
-    3. Set ANALYZER_BACKEND=llm in .env.
-
-No route, service, schema or frontend file changes. The LLM's JSON output
-(outcome / reason / follow_up_required / follow_up_datetime) maps 1:1 onto
-AnalysisResult, which is why the contract is shaped this way.
-
-NOTE: this MVP makes NO network or LLM calls of any kind.
+Per spec S12 this analyzer never invents a follow-up date. If the transcript
+contains no explicit or relative date, the follow-up is required but
+unscheduled (datetime=None) and the lead lands in the UNSCHEDULED bucket.
 """
 
 import re
 from datetime import datetime, time, timedelta, timezone
-from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
-
-from app.config import settings
+from app.models.analysis import NO_DATE_REASON, AnalysisFollowUp, CallAnalysisResult, CustomerIntent
 from app.models.call import Outcome
 
-# --------------------------------------------------------------------------
-# Output contract -- identical in shape to the future LLM's structured JSON.
-# --------------------------------------------------------------------------
-
-
-class AnalysisResult(BaseModel):
-    outcome: Outcome
-    reason: str
-    follow_up_required: bool = False
-    follow_up_datetime: datetime | None = None
-
-    # Provenance / quality signals. An LLM implementation fills these too.
-    analyzer: str = "keyword-v1"
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    matched_phrase: str | None = None
-
-
-@runtime_checkable
-class CallAnalyzer(Protocol):
-    """The single interface an analyzer must satisfy."""
-
-    name: str
-
-    def analyze_call(
-        self, transcript: str, *, context: dict | None = None
-    ) -> AnalysisResult: ...
-
+KEYWORD_MODEL_NAME = "keyword-fallback-v1"
 
 # --------------------------------------------------------------------------
-# Deterministic keyword rules (MVP)
+# Phrase tables
 # --------------------------------------------------------------------------
 
-# Evaluated in this order. DROPPED wins over CONVERTED so a transcript like
-# "I paid for another course, not interested in this one" resolves correctly.
 DROPPED_PHRASES = [
     "not interested anymore",
     "no longer interested",
     "not interested",
+    "decided not to join",
     "don't want the course",
     "dont want the course",
     "do not want the course",
+    "don't want to join",
+    "dont want to join",
     "please don't call",
     "please dont call",
     "don't contact me",
     "dont contact me",
+    "do not contact me",
     "cancel my",
     "cancel the",
     "cancel",
@@ -90,6 +53,9 @@ CONVERTED_PHRASES = [
     "i have completed the payment",
     "payment completed",
     "completed the payment",
+    "payment is done",
+    "paid the fees",
+    "i have paid",
     "i want to enroll",
     "want to enroll",
     "i want to proceed",
@@ -97,25 +63,42 @@ CONVERTED_PHRASES = [
     "i have registered",
     "decided to join",
     "send me the enrollment details",
+    "confirm my enrollment",
 ]
 
 FOLLOW_UP_PHRASES = [
     "call me tomorrow",
     "call me later",
     "call me next week",
+    "call me this evening",
+    "call me in the evening",
     "contact me tomorrow",
     "follow up tomorrow",
+    "get back to you",
     "get back to me",
     "i will discuss and let you know",
     "discuss and let you know",
+    "discuss it with my family",
+    "discuss with my parents",
+    "discuss the fees with my parents",
     "please call again",
     "call me back",
     "call me on",
     "call me at",
+    "haven't made the payment yet",
+    "have not made the payment yet",
+]
+
+# Phrases that signal payment is pending but intent is positive.
+PAYMENT_PENDING_PHRASES = [
+    "haven't made the payment",
+    "have not made the payment",
+    "will make the payment",
+    "will pay",
+    "not yet paid",
 ]
 
 DEFAULT_FOLLOW_UP_TIME = time(hour=10, minute=0)
-DEFAULT_FOLLOW_UP_DAYS = 1
 
 _MONTHS = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -137,32 +120,41 @@ _TIME_RE = re.compile(
 )
 
 
+# --------------------------------------------------------------------------
+# Date / time extraction
+# --------------------------------------------------------------------------
+
+
 def _extract_time(text: str) -> time | None:
     match = _TIME_RE.search(text)
-    if not match:
-        return None
-    if match.group(3):  # 12-hour form with am/pm
-        hour = int(match.group(1))
-        minute = int(match.group(2) or 0)
-        meridiem = match.group(3).lower()
-        if meridiem == "pm" and hour != 12:
-            hour += 12
-        elif meridiem == "am" and hour == 12:
-            hour = 0
-    else:  # 24-hour form
-        hour = int(match.group(4))
-        minute = int(match.group(5))
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-    return time(hour=hour, minute=minute)
+    if match:
+        if match.group(3):  # 12-hour form with am/pm
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            meridiem = match.group(3).lower()
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+        else:  # 24-hour form
+            hour = int(match.group(4))
+            minute = int(match.group(5))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return time(hour=hour, minute=minute)
+
+    lowered = text.lower()
+    if "evening" in lowered:
+        return time(hour=18, minute=0)
+    if "afternoon" in lowered:
+        return time(hour=14, minute=0)
+    if "morning" in lowered:
+        return time(hour=10, minute=0)
+    return None
 
 
 def _extract_date(text: str, reference: datetime) -> datetime | None:
-    """Explicit dates first, then simple relative keywords.
-
-    Deliberately simple -- the MVP demonstrates the architecture, not a
-    natural-language date parser. An LLM will handle the hard cases later.
-    """
+    """Explicit dates first, then simple relative keywords. Returns None when
+    the transcript gives no usable date -- it is never guessed."""
     iso = _ISO_DATE_RE.search(text)
     if iso:
         try:
@@ -196,23 +188,14 @@ def _extract_date(text: str, reference: datetime) -> datetime | None:
     return None
 
 
-def _resolve_follow_up_datetime(transcript: str, reference: datetime) -> datetime:
-    """Combine any date and time found in the transcript into one UTC instant."""
+def _resolve_follow_up_datetime(transcript: str, reference: datetime) -> datetime | None:
+    """Combine any date and time found into one instant, or None if no date."""
     base = _extract_date(transcript, reference)
-    clock = _extract_time(transcript)
-
     if base is None:
-        base = reference + timedelta(days=DEFAULT_FOLLOW_UP_DAYS)
-
-    resolved = base.replace(
-        hour=(clock or DEFAULT_FOLLOW_UP_TIME).hour,
-        minute=(clock or DEFAULT_FOLLOW_UP_TIME).minute,
-        second=0,
-        microsecond=0,
-    )
-
-    # If the transcript gave only a time and it has already passed, roll forward
-    # a day so the follow-up is never scheduled in the past.
+        return None
+    clock = _extract_time(transcript) or DEFAULT_FOLLOW_UP_TIME
+    resolved = base.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+    # A bare time that has already passed today means tomorrow.
     if resolved <= reference:
         resolved += timedelta(days=1)
     return resolved
@@ -225,104 +208,108 @@ def _find_phrase(text: str, phrases: list[str]) -> str | None:
     return None
 
 
+def _sentence_containing(text: str, phrase: str) -> str:
+    """The sentence of the transcript that matched, for key_points."""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if phrase in sentence.lower():
+            return sentence.strip().rstrip(".")
+    return phrase
+
+
+# --------------------------------------------------------------------------
+# Analyzer
+# --------------------------------------------------------------------------
+
+
 class KeywordCallAnalyzer:
-    """Deterministic rule-based analyzer used for this MVP."""
+    """Rule-based analyzer producing the shared CallAnalysisResult contract."""
 
-    name = "keyword-v1"
+    name = KEYWORD_MODEL_NAME
 
-    def analyze_call(
-        self, transcript: str, *, context: dict | None = None
-    ) -> AnalysisResult:
-        text = (transcript or "").lower().strip()
-        context = context or {}
-
-        reference = context.get("call_ended_at") or datetime.now(timezone.utc)
+    def analyze(self, transcript: str, *, call_ended_at: datetime | None = None) -> CallAnalysisResult:
+        original = (transcript or "").strip()
+        text = original.lower()
+        reference = call_ended_at or datetime.now(timezone.utc)
         if reference.tzinfo is None:
             reference = reference.replace(tzinfo=timezone.utc)
 
         if not text:
-            return AnalysisResult(
+            return CallAnalysisResult(
                 outcome=Outcome.FOLLOW_UP_REQUIRED,
-                reason="Transcript was empty, so the lead is kept in the follow-up queue for a manual callback.",
                 follow_up_required=True,
-                follow_up_datetime=_resolve_follow_up_datetime("", reference),
-                analyzer=self.name,
+                follow_up=AnalysisFollowUp(reason=NO_DATE_REASON),
+                customer_intent=CustomerIntent.UNCLEAR,
+                summary="The transcript was empty, so the lead was kept in the follow-up queue "
+                        "for a manual callback.",
+                key_points=["Empty transcript"],
                 confidence=0.1,
             )
 
         dropped = _find_phrase(text, DROPPED_PHRASES)
         if dropped:
-            return AnalysisResult(
+            return CallAnalysisResult(
                 outcome=Outcome.DROPPED,
-                reason=f'Lead indicated they are no longer interested ("{dropped}"). No follow-up scheduled.',
-                follow_up_required=False,
-                analyzer=self.name,
-                confidence=0.9,
-                matched_phrase=dropped,
+                customer_intent=CustomerIntent.NOT_INTERESTED,
+                summary="Lead indicated they are no longer interested in the course.",
+                key_points=[_sentence_containing(original, dropped)],
+                confidence=0.85,
             )
 
         converted = _find_phrase(text, CONVERTED_PHRASES)
-        if converted:
-            return AnalysisResult(
+        pending_payment = _find_phrase(text, PAYMENT_PENDING_PHRASES)
+        if converted and not pending_payment:
+            return CallAnalysisResult(
                 outcome=Outcome.CONVERTED,
-                reason=f'Lead confirmed they are moving forward with the course ("{converted}"). No follow-up needed.',
-                follow_up_required=False,
-                analyzer=self.name,
-                confidence=0.9,
-                matched_phrase=converted,
-            )
-
-        follow_up = _find_phrase(text, FOLLOW_UP_PHRASES)
-        if follow_up:
-            when = _resolve_follow_up_datetime(text, reference)
-            return AnalysisResult(
-                outcome=Outcome.FOLLOW_UP_REQUIRED,
-                reason=f'Lead asked to be contacted again ("{follow_up}"). Callback scheduled for {when:%d %b %Y %H:%M} UTC.',
-                follow_up_required=True,
-                follow_up_datetime=when,
-                analyzer=self.name,
+                customer_intent=CustomerIntent.READY_TO_ENROLL,
+                summary="Lead confirmed they are enrolling / have completed payment.",
+                key_points=[_sentence_containing(original, converted)],
                 confidence=0.85,
-                matched_phrase=follow_up,
             )
 
-        # Nothing matched: keep the lead in the queue rather than letting it
-        # silently disappear from the BD's worklist. Low confidence flags it as
-        # a case the future LLM analyzer should handle better.
+        follow_up = _find_phrase(text, FOLLOW_UP_PHRASES) or pending_payment
         when = _resolve_follow_up_datetime(text, reference)
-        return AnalysisResult(
+        matched = follow_up or "no clear outcome"
+        if follow_up:
+            intent = CustomerIntent.INTERESTED
+            if "parents" in text or "family" in text or "discuss" in text:
+                intent = CustomerIntent.NEEDS_TIME
+            if "fee" in text or "emi" in text or "discount" in text:
+                intent = CustomerIntent.PRICE_SENSITIVE
+            if pending_payment:
+                intent = CustomerIntent.READY_TO_ENROLL
+            confidence = 0.75 if when else 0.6
+            summary = (
+                "Lead remains interested and asked to be contacted again."
+                if when else
+                "Lead remains interested and asked to be contacted again, but did not name a time."
+            )
+        else:
+            intent = CustomerIntent.UNCLEAR
+            confidence = 0.3
+            summary = ("No clear outcome was detected in the transcript; the lead is kept in "
+                       "the follow-up queue so it is not lost.")
+
+        reason = (
+            f"Lead asked to be contacted again (\"{matched}\")."
+            if when else NO_DATE_REASON
+        )
+        key_points = [_sentence_containing(original, follow_up)] if follow_up else []
+        if when:
+            key_points.append(f"Requested callback around {when:%d %b %Y %H:%M} UTC")
+
+        return CallAnalysisResult(
             outcome=Outcome.FOLLOW_UP_REQUIRED,
-            reason="No clear outcome detected in the transcript; kept for follow-up so the lead is not lost.",
             follow_up_required=True,
-            follow_up_datetime=when,
-            analyzer=self.name,
-            confidence=0.3,
+            follow_up=AnalysisFollowUp(datetime=when, reason=reason),
+            customer_intent=intent,
+            summary=summary,
+            key_points=key_points,
+            confidence=confidence,
         )
 
 
-# --------------------------------------------------------------------------
-# Registry -- add "llm" here when the LLM analyzer lands.
-# --------------------------------------------------------------------------
-
-_ANALYZERS: dict[str, type] = {
-    "keyword": KeywordCallAnalyzer,
-    # "llm": LLMCallAnalyzer,
-}
-
-_instances: dict[str, CallAnalyzer] = {}
+_analyzer = KeywordCallAnalyzer()
 
 
-def get_analyzer(backend: str | None = None) -> CallAnalyzer:
-    """Return the configured analyzer. Callers never name a concrete class."""
-    key = (backend or settings.analyzer_backend or "keyword").lower()
-    if key not in _ANALYZERS:
-        raise ValueError(
-            f"Unknown ANALYZER_BACKEND '{key}'. Available: {', '.join(sorted(_ANALYZERS))}"
-        )
-    if key not in _instances:
-        _instances[key] = _ANALYZERS[key]()
-    return _instances[key]
-
-
-def analyze_call(transcript: str, *, context: dict | None = None) -> AnalysisResult:
-    """Module-level convenience wrapper matching the spec's analyze_call(transcript)."""
-    return get_analyzer().analyze_call(transcript, context=context)
+def analyze_call(transcript: str, *, call_ended_at: datetime | None = None) -> CallAnalysisResult:
+    return _analyzer.analyze(transcript, call_ended_at=call_ended_at)

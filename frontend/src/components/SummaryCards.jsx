@@ -3,8 +3,8 @@ const CARDS = [
   { key: 'follow_ups_required', label: 'Follow-ups Required', cls: 'upcoming', bucket: 'ALL' },
   { key: 'due_today', label: 'Due Today', cls: 'due', bucket: 'DUE_TODAY' },
   { key: 'overdue', label: 'Overdue', cls: 'overdue', bucket: 'OVERDUE' },
-  { key: 'converted', label: 'Converted', cls: 'converted', bucket: null },
-  { key: 'dropped', label: 'Dropped', cls: 'dropped', bucket: null },
+  { key: 'converted', label: 'Converted', cls: 'converted', bucket: 'CONVERTED' },
+  { key: 'dropped', label: 'Dropped', cls: 'dropped', bucket: 'DROPPED' },
 ]
 
 export default function SummaryCards({ summary, activeBucket, onSelectBucket }) {

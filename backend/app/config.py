@@ -9,10 +9,12 @@ app must still boot, serve the dashboard and seed data when Google Cloud has
 not been configured yet. Only the AI-dependent routes fail in that case.
 """
 
+import json
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -36,7 +38,17 @@ class Settings(BaseSettings):
     google_cloud_location: str = Field("us-central1", alias="GOOGLE_CLOUD_LOCATION")
     vertex_ai_model: str = Field("gemini-2.5-flash", alias="VERTEX_AI_MODEL")
     google_application_credentials: str = Field("", alias="GOOGLE_APPLICATION_CREDENTIALS")
+    # On platforms with no writable/persistent path to hand GOOGLE_APPLICATION_CREDENTIALS
+    # (e.g. Vercel), paste the service-account key's raw JSON here instead. It's written to a
+    # temp file once per cold start and google_application_credentials is pointed at it below.
+    google_credentials_json: str = Field("", alias="GOOGLE_CREDENTIALS_JSON")
     google_genai_use_vertexai: bool = Field(True, alias="GOOGLE_GENAI_USE_VERTEXAI")
+
+    # ---- Feature gate --------------------------------------------------------
+    # The entire "Analyze New Call" section (UI) and its ingestion/processing
+    # endpoints are hidden/disabled unless this is explicitly set to true.
+    # Default false: "only if the variable in the env is specified".
+    call_analyzer_enabled: bool = Field(False, alias="CALL_ANALYZER_ENABLED")
 
     # ---- Pipeline ----------------------------------------------------------
     transcription_provider: str = Field("vertex", alias="TRANSCRIPTION_PROVIDER")
@@ -67,6 +79,15 @@ class Settings(BaseSettings):
         if mode not in {"local", "url"}:
             raise ValueError("AUDIO_STORAGE_MODE must be 'local' or 'url'")
         return mode
+
+    @model_validator(mode="after")
+    def _materialize_credentials_json(self) -> "Settings":
+        if self.google_credentials_json.strip() and not self.google_application_credentials.strip():
+            fd, path = tempfile.mkstemp(prefix="gcp-credentials-", suffix=".json")
+            with open(fd, "w") as handle:
+                json.dump(json.loads(self.google_credentials_json), handle)
+            self.google_application_credentials = path
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:

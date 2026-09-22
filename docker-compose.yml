@@ -1,0 +1,62 @@
+# Local stack: MongoDB + FastAPI backend + Vite frontend.
+#
+#   cp .env.example .env            # fill in GOOGLE_CLOUD_PROJECT etc.
+#   docker compose up --build
+#
+# Backend -> http://localhost:8000   Frontend -> http://localhost:5173
+#
+# Google Cloud auth inside the container uses a service-account key mounted
+# from GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH. The key never enters the image.
+
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      MONGODB_URL: mongodb://mongo:27017
+      DATABASE_NAME: lead_followup_db
+      CALL_ANALYZER_ENABLED: ${CALL_ANALYZER_ENABLED:-true}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-us-central1}
+      VERTEX_AI_MODEL: ${VERTEX_AI_MODEL:-gemini-2.5-flash}
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/service-account.json
+      GOOGLE_GENAI_USE_VERTEXAI: "true"
+      TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vertex}
+      ANALYSIS_FALLBACK_ENABLED: ${ANALYSIS_FALLBACK_ENABLED:-true}
+      AUDIO_STORAGE_MODE: ${AUDIO_STORAGE_MODE:-local}
+      AUDIO_PLAYBACK_ENABLED: ${AUDIO_PLAYBACK_ENABLED:-true}
+      AUDIO_UPLOAD_DIR: /data/uploads
+      MAX_AUDIO_MB: ${MAX_AUDIO_MB:-20}
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    volumes:
+      - uploads:/data/uploads
+      - ${GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH:-./service-account.json}:/secrets/service-account.json:ro
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+
+volumes:
+  mongo_data:
+  uploads:
