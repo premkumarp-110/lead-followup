@@ -11,3 +11,6 @@ httpx==0.28.1
 
 # Google Gen AI SDK -- used in Vertex AI mode for both transcription and analysis.
 google-genai==2.24.0
+
+# In-process scheduler for the daily follow-up alert email digest.
+apscheduler==3.11.0

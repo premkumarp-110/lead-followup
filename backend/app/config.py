@@ -82,6 +82,19 @@ class Settings(BaseSettings):
 
     cors_origins: str = Field("http://localhost:5173", alias="CORS_ORIGINS")
 
+    # ---- Follow-up alert emails (SMTP) -------------------------------------
+    # Daily digest emailing each BD their currently OVERDUE leads. Blank until
+    # configured; `email_config_error` turns that into a readable message at
+    # call time, same pattern as Vertex AI above.
+    followup_alerts_enabled: bool = Field(False, alias="FOLLOWUP_ALERTS_ENABLED")
+    followup_alert_hour: int = Field(9, alias="FOLLOWUP_ALERT_HOUR", ge=0, le=23)
+    followup_alert_minute: int = Field(0, alias="FOLLOWUP_ALERT_MINUTE", ge=0, le=59)
+    smtp_host: str = Field("smtp.gmail.com", alias="SMTP_HOST")
+    smtp_port: int = Field(587, alias="SMTP_PORT")
+    smtp_user: str = Field("", alias="SMTP_USER")
+    smtp_password: str = Field("", alias="SMTP_PASSWORD")
+    smtp_from_email: str = Field("", alias="SMTP_FROM_EMAIL")
+
     @field_validator("mongodb_url", "database_name")
     @classmethod
     def _not_blank(cls, value: str) -> str:
@@ -128,6 +141,11 @@ class Settings(BaseSettings):
         path = Path(self.audio_upload_dir)
         return path if path.is_absolute() else BACKEND_DIR / path
 
+    @property
+    def smtp_from(self) -> str:
+        """The From: address -- falls back to the login user when unset."""
+        return self.smtp_from_email.strip() or self.smtp_user.strip()
+
     def vertex_config_error(self) -> str | None:
         """Return a readable reason Vertex AI cannot be used, or None if it can.
 
@@ -170,6 +188,21 @@ class Settings(BaseSettings):
                 "CALL_ANALYSIS_MODEL is not set in backend/.env "
                 "(e.g. global.anthropic.claude-sonnet-5)."
             )
+        return None
+
+    def email_config_error(self) -> str | None:
+        """Return a readable reason follow-up alert emails cannot be sent, or None if they can.
+
+        Checked at call time, not at startup, so the app boots and the scheduler
+        starts even when SMTP isn't configured yet -- the daily job just logs a
+        warning and skips sending.
+        """
+        if not self.smtp_host.strip():
+            return "SMTP_HOST is not set in backend/.env."
+        if not self.smtp_user.strip():
+            return "SMTP_USER is not set in backend/.env (the mailbox to send alerts from)."
+        if not self.smtp_password.strip():
+            return "SMTP_PASSWORD is not set in backend/.env (an app password, not the account password)."
         return None
 
 

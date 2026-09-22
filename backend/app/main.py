@@ -12,6 +12,7 @@ from app.config import settings
 from app.database import close_client, ensure_indexes, ping
 from app.models.schemas import UIConfig
 from app.routes import callers, calls, dashboard, leads
+from app.scheduler import start_scheduler, stop_scheduler
 from app.services.audio_service import AudioValidationError
 from app.services.transcription_service import TranscriptionError
 from app.services.vertex_client import VertexUnavailable
@@ -40,7 +41,14 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "Vertex AI is NOT configured -- audio analysis will fail until fixed: %s", vertex_error
         )
+
+    scheduler = start_scheduler()
+    email_error = settings.email_config_error()
+    if settings.followup_alerts_enabled and email_error:
+        logger.warning("Follow-up alerts are enabled but SMTP is not configured: %s", email_error)
+
     yield
+    stop_scheduler(scheduler)
     close_client()
 
 
