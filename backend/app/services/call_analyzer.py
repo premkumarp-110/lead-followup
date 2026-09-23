@@ -25,6 +25,16 @@ from app.models.call import Outcome
 
 KEYWORD_MODEL_NAME = "keyword-fallback-v1"
 
+# This analyzer NEVER reports sentiment. It matches literal phrases, which is
+# enough to recognise an explicit refusal or a confirmed payment, but a tone
+# *score* derived from counting keywords would be a guess dressed as a
+# measurement -- and it would be written to the lead and used to order the
+# worklist. Every result below therefore leaves `sentiment` at its default
+# (UNKNOWN, no score), and the UI says tone was not assessed.
+#
+# `CallAnalysisResult.sentiment` defaults to exactly that, so there is nothing
+# to set explicitly; this comment exists so nobody "fixes" the omission later.
+
 # --------------------------------------------------------------------------
 # Phrase tables
 # --------------------------------------------------------------------------
@@ -311,5 +321,113 @@ class KeywordCallAnalyzer:
 _analyzer = KeywordCallAnalyzer()
 
 
+# --------------------------------------------------------------------------
+# Transcript markup
+# --------------------------------------------------------------------------
+# CRM transcripts are line-oriented: "[01:20] Customer: call me back at 8 PM".
+# The leading [MM:SS] is an OFFSET INTO THE RECORDING, not a clock time -- but
+# it is indistinguishable from "HH:MM" to the time regex below, and it always
+# appears earlier in the line than anything the speaker actually said. Left in
+# place it wins every time, so a call agreed for "8 PM" gets scheduled for
+# 01:20. Strip the markup before any date or time extraction.
+
+_TIMESTAMP_PREFIX_RE = re.compile(r"\[\s*\d{1,3}:\d{2}(?::\d{2})?\s*\]")
+_SPEAKER_LABEL_RE = re.compile(r"^\s*(?:agent|customer|bd|lead|speaker\s*\d+)\s*:\s*", re.I)
+
+
+def strip_transcript_markup(transcript: str) -> str:
+    """Remove [MM:SS] offsets and speaker labels, keeping the spoken text."""
+    lines = []
+    for line in (transcript or "").splitlines():
+        line = _TIMESTAMP_PREFIX_RE.sub(" ", line)
+        line = _SPEAKER_LABEL_RE.sub("", line.strip())
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Language guard
+# --------------------------------------------------------------------------
+# Everything below this module matches is an English phrase table. Real CRM
+# transcripts are frequently romanized Tamil/Malayalam mixed with English --
+# "ippo vendaam, naan paarkala" ("not now, I haven't looked at it") matches no
+# DROPPED phrase, no CONVERTED phrase and no date regex. The analyzer would then
+# fall through to its default and return a *confidently wrong* outcome, which
+# apply_analysis_to_lead writes straight to the lead.
+#
+# So the fallback declines rather than guessing. A visible failure is recoverable;
+# a wrong outcome silently written to a lead is not.
+
+# Function words that are common in English and rare as whole words in romanized
+# Indic speech. Cheap, dependency-free, and only needs to separate two cases.
+_ENGLISH_MARKERS = frozenset(
+    """the is are was were will would can could should have has had
+    you your yours i me my we our they them their this that these those
+    and or but not with for from about into
+    yes no okay ok please thank thanks sorry
+    call back later week month day time tomorrow today
+    course fee fees price payment interested join""".split()
+)
+
+# Romanized-Indic markers. Presence is strong evidence the phrase tables do not apply.
+_INDIC_MARKERS = frozenset(
+    """naan nee avanga enna enaku enakku ungalukku ungala unga namma nalla
+    illa illai vendaam venam irukku irukkeen irukkanga panna pannunga pannitu
+    sollunga solli sollu paaka paarkala theriyala theriyum konjam romba
+    appuram ippo appo inniki naalaikku naale vantha vandhu
+    aana aanaa adhu idhu edhu epdi eppadi eppo yaaru
+    hai nahi haan kya kaise kyun mujhe aap aapko hum tum mera tera
+    karna karenge bataiye bolo thoda bahut abhi kal aaj
+    njan ningal enthu evide ippol sheri alla undu illa
+    nenu meeru ela enti ledu unnadi cheyandi""".split()
+)
+
+# Below this share of recognisable English, refuse.
+MIN_ENGLISH_SHARE = 0.18
+# Too short to judge either way -- let it through; the phrase tables are
+# conservative and a two-word transcript has nothing to mislabel.
+MIN_WORDS_TO_JUDGE = 25
+
+_WORD_RE = re.compile(r"[a-z]+")
+
+
+def _spoken_words(transcript: str) -> list[str]:
+    """Words actually spoken, with timestamps and speaker labels stripped."""
+    return _WORD_RE.findall(strip_transcript_markup(transcript).lower())
+
+
+def language_profile(transcript: str) -> dict:
+    """English / Indic marker shares for a transcript. Exposed for diagnostics."""
+    words = _spoken_words(transcript)
+    total = len(words)
+    if not total:
+        return {"words": 0, "english_share": 0.0, "indic_share": 0.0}
+    english = sum(1 for word in words if word in _ENGLISH_MARKERS)
+    indic = sum(1 for word in words if word in _INDIC_MARKERS)
+    return {
+        "words": total,
+        "english_share": english / total,
+        "indic_share": indic / total,
+    }
+
+
+def is_analyzable_language(transcript: str) -> bool:
+    """Whether the English phrase tables can be trusted on this transcript.
+
+    False for romanized Tamil/Malayalam/Hindi/Telugu, where every rule below
+    would silently miss and the default outcome would be returned as if it were
+    a real finding.
+    """
+    profile = language_profile(transcript)
+    if profile["words"] < MIN_WORDS_TO_JUDGE:
+        return True
+    if profile["indic_share"] > profile["english_share"]:
+        return False
+    return profile["english_share"] >= MIN_ENGLISH_SHARE
+
+
 def analyze_call(transcript: str, *, call_ended_at: datetime | None = None) -> CallAnalysisResult:
-    return _analyzer.analyze(transcript, call_ended_at=call_ended_at)
+    # Strip [MM:SS] offsets and speaker labels first: they are recording
+    # positions, not things anyone said, and they otherwise hijack the time
+    # extraction on every CRM transcript.
+    return _analyzer.analyze(strip_transcript_markup(transcript), call_ended_at=call_ended_at)

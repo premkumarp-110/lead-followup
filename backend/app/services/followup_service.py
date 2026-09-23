@@ -8,18 +8,23 @@ This module does not know where an analysis came from -- Gemini, the keyword
 fallback and the seed all arrive here as a `CallAnalysisResult`.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from pymongo.database import Database
 
 from app.database import CALLS, LEADS
 from app.models.analysis import CallAnalysisResult
 from app.models.call import CallStatus, Outcome
-from app.models.lead import FollowUpAction, FollowUpBucket, FollowUpStatus, LeadStatus
+from app.models.analysis import SentimentLabel, SentimentTrajectory
+from app.models.lead import FollowUpBucket, FollowUpStatus, LeadStatus
 from app.models.schemas import FollowUpActionRequest
 
 # A follow-up counts as DUE (rather than UPCOMING) once it is this close.
 DUE_WINDOW = timedelta(hours=2)
+
+# The business timezone. Everything is stored in UTC; "today" only ever means
+# a calendar day here, so any code asking "is this due today?" must ask in IST.
+IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 
 OUTCOME_TO_LEAD_STATUS = {
     Outcome.FOLLOW_UP_REQUIRED: LeadStatus.FOLLOW_UP,
@@ -29,6 +34,15 @@ OUTCOME_TO_LEAD_STATUS = {
 
 # Order used when sorting the active worklist: most urgent first, and leads
 # with no date at the end (they need a call to *set* a date, not a timed one).
+# Worst first. UNKNOWN sits with NEUTRAL on purpose -- see `sentiment_rank`.
+SENTIMENT_SORT_ORDER = {
+    SentimentLabel.NEGATIVE.value: 0,
+    SentimentLabel.MIXED.value: 1,
+    SentimentLabel.NEUTRAL.value: 2,
+    SentimentLabel.UNKNOWN.value: 2,
+    SentimentLabel.POSITIVE.value: 3,
+}
+
 BUCKET_SORT_ORDER = {
     FollowUpBucket.OVERDUE.value: 0,
     FollowUpBucket.DUE.value: 1,
@@ -45,6 +59,22 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def ist_date(value: datetime | None) -> date | None:
+    """The IST calendar date of an instant, or None.
+
+    Comparing dates in UTC puts anything after 18:30 IST on the wrong day,
+    which is how a "due today" digest ends up missing the evening's calls.
+    """
+    value = _as_utc(value)
+    return value.astimezone(IST).date() if value else None
+
+
+def is_ist_today(value: datetime | None, now: datetime | None = None) -> bool:
+    """Does this instant fall on the same IST calendar day as `now`?"""
+    when = ist_date(value)
+    return when is not None and when == ist_date(now or utcnow())
 
 
 # --------------------------------------------------------------------------
@@ -85,8 +115,33 @@ def decorate_lead(lead: dict, now: datetime | None = None) -> dict:
     return lead
 
 
+def sentiment_rank(latest_sentiment: dict | None) -> int:
+    """Worst-feeling leads first. Lower sorts earlier.
+
+    A DECLINED trajectory outranks the label entirely: a call that ended worse
+    than it started is the earliest sign a lead is going cold, even when the
+    tone averaged out to NEUTRAL.
+
+    UNKNOWN deliberately ranks alongside NEUTRAL rather than best or worst --
+    un-analysed leads and fallback-analysed ones should neither jump the queue
+    nor sink out of sight for a tone nobody actually measured.
+    """
+    sentiment = latest_sentiment or {}
+    if (sentiment.get("trajectory") or "") == SentimentTrajectory.DECLINED.value:
+        return 0
+    return SENTIMENT_SORT_ORDER.get(sentiment.get("label") or "", 2)
+
+
 def sort_worklist(leads: list[dict]) -> list[dict]:
-    """Overdue -> due -> upcoming (each soonest first) -> unscheduled.
+    """Overdue -> due -> upcoming -> unscheduled, worst sentiment first within each.
+
+    Two things are being balanced. Urgency still dominates: an overdue lead
+    always precedes a due one. Within a bucket, though, sentiment leads and the
+    datetime only breaks ties -- so a three-hour-overdue lead whose call was
+    going badly surfaces above a two-day-overdue lead who sounded happy.
+
+    That is deliberate, and it is why the worklist no longer claims "oldest
+    first". To go back to pure recency, drop `rank` from the key tuple.
 
     Mongo sorts null datetimes FIRST in ascending order, which would put
     unscheduled leads at the top; this puts them where they belong.
@@ -97,7 +152,8 @@ def sort_worklist(leads: list[dict]) -> list[dict]:
         follow_up = lead.get("follow_up") or {}
         bucket = follow_up.get("bucket") or compute_bucket(follow_up).value
         when = _as_utc(follow_up.get("datetime")) or far_future
-        return (BUCKET_SORT_ORDER.get(bucket, 9), when)
+        rank = sentiment_rank(lead.get("latest_sentiment"))
+        return (BUCKET_SORT_ORDER.get(bucket, 9), rank, when)
 
     return sorted(leads, key=key)
 
@@ -158,13 +214,13 @@ def is_latest_call(db: Database, lead_id: str, call: dict) -> bool:
     overwriting a newer call's outcome, and an unprocessed or failed call has
     no outcome to protect.
     """
-    this_ended = _as_utc(call.get("ended_at") or call.get("created_at"))
+    this_ended = _as_utc(call.get("end_time") or call.get("created_at"))
     newer = db[CALLS].find_one(
         {
             "lead_id": lead_id,
             "call_id": {"$ne": call["call_id"]},
             "status": CallStatus.COMPLETED.value,
-            "ended_at": {"$gt": this_ended},
+            "end_time": {"$gt": this_ended},
         }
     )
     return newer is None
@@ -190,9 +246,12 @@ def apply_analysis_to_lead(
             "$set": {
                 "lead_status": OUTCOME_TO_LEAD_STATUS[analysis.outcome].value,
                 "follow_up": follow_up_block_from_analysis(analysis),
-                "last_call_at": _as_utc(call.get("ended_at")) or _as_utc(call.get("created_at")),
+                "last_call_at": _as_utc(call.get("end_time")) or _as_utc(call.get("created_at")),
                 "latest_call_id": call["call_id"],
                 "latest_outcome": analysis.outcome.value,
+                # Denormalized so the worklist can order by it and the leads
+                # list can filter on it without joining call_analyses.
+                "latest_sentiment": analysis.sentiment.model_dump(mode="json"),
                 "latest_analysis_id": analysis_id,
                 "updated_at": now,
             }
@@ -207,7 +266,17 @@ def apply_analysis_to_lead(
 
 
 def apply_followup_action(db: Database, lead: dict, request: FollowUpActionRequest) -> dict:
-    """Apply COMPLETE / CANCEL / RESCHEDULE, recording the reason in history.
+    """Reschedule a follow-up, recording the reason in history.
+
+    RESCHEDULE is the only action a BD can take. COMPLETE and CANCEL are
+    retired (see `FollowUpAction`) -- a BD closing a follow-up by hand empties
+    the queue without anything having happened, so closure is driven entirely
+    by call analysis. `FollowUpActionRequest` refuses the retired values, so
+    nothing else can reach this function.
+
+    Consequence worth knowing: `follow_up.status` can now only ever hold
+    PENDING on new data, and `LeadStatus.CONTACTED` is no longer reachable from
+    here (it is still written from CRM stages by `stage_mapping`).
 
     Returns the updated lead. Raises ValueError when the lead has no active
     follow-up to act on (the route turns that into a 409).
@@ -221,18 +290,12 @@ def apply_followup_action(db: Database, lead: dict, request: FollowUpActionReque
     now = utcnow()
     from_status = follow_up.get("status")
     previous_datetime = _as_utc(follow_up.get("datetime"))
-    new_datetime = None
 
-    if request.action is FollowUpAction.COMPLETE:
-        follow_up["status"] = FollowUpStatus.COMPLETED.value
-        lead_status = LeadStatus.CONTACTED.value
-    elif request.action is FollowUpAction.CANCEL:
-        follow_up["status"] = FollowUpStatus.CANCELLED.value
-        lead_status = LeadStatus.CONTACTED.value
-    else:  # RESCHEDULE
-        new_datetime = _as_utc(request.new_datetime)
-        follow_up = build_follow_up_block(new_datetime, reason=follow_up.get("reason"))
-        lead_status = LeadStatus.FOLLOW_UP.value
+    new_datetime = _as_utc(request.new_datetime)
+    # Rebuilding the block resets status to PENDING and re-derives date/time
+    # from the new instant; the original reason is carried across.
+    follow_up = build_follow_up_block(new_datetime, reason=follow_up.get("reason"))
+    lead_status = LeadStatus.FOLLOW_UP.value
 
     history_entry = {
         "action": request.action.value,

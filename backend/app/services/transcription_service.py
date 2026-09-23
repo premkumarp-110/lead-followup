@@ -6,6 +6,11 @@ means, or that an analysis will follow. That separation is deliberate (spec
 S8): the transcription provider can be replaced without touching analysis, and
 vice versa.
 
+Audio comes from the CRM now, fetched and cached by `audio_service`. The only
+calls that reach here are the ones with a recording but no CRM transcript --
+measured live, that is a small minority, because ~55% of analyzable calls
+already ship a transcript and transcription is the most expensive step.
+
 Interface:
 
     transcribe_audio(source) -> TranscriptResult   # {text, language, duration_seconds}
@@ -17,11 +22,11 @@ and fail with a clear message explaining what to install/configure.
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 from app.config import settings
-from app.services.audio_service import AudioSource, download_url_to_temp, probe_duration
+from app.services import audio_service
+from app.services.lead_call_client import LeadCallAPIError
 from app.services.vertex_client import VertexUnavailable, describe_api_error, get_client
 
 logger = logging.getLogger(__name__)
@@ -33,6 +38,16 @@ class TranscriptionError(RuntimeError):
 
 class TranscriptionNotConfigured(TranscriptionError):
     """The selected provider is not available in this deployment."""
+
+
+@dataclass
+class AudioSource:
+    """What the transcriber needs to fetch and describe one call's audio."""
+
+    call_id: str
+    crm_call_id: str | None = None
+    mime_type: str = audio_service.AUDIO_MIME
+    duration_seconds: int | None = None
 
 
 @dataclass
@@ -55,18 +70,23 @@ class Transcriber(Protocol):
 
 
 def _load_audio_bytes(source: AudioSource) -> tuple[bytes, str]:
-    """Return (bytes, mime_type) for either storage mode."""
-    if source.file_path:
-        path = Path(source.file_path)
-        if not path.exists():
-            raise TranscriptionError(
-                "The stored audio file is missing from disk. Re-upload the recording."
-            )
-        return path.read_bytes(), source.mime_type
-    if source.url:
-        data, mime = download_url_to_temp(source.url)
-        return data, (mime if mime.startswith(("audio/", "video/")) else source.mime_type)
-    raise TranscriptionError("The call has neither a stored file nor an audio URL.")
+    """Fetch the call's audio, going through the CRM cache.
+
+    Every failure mode upstream -- no recording, an unconfigured key, a CRM
+    outage -- becomes a TranscriptionError with the operator-facing wording the
+    client already produced, so the pipeline records one clear reason.
+    """
+    try:
+        data = audio_service.load_audio_bytes(source.call_id, source.crm_call_id)
+    except audio_service.RecordingNotAvailable as exc:
+        raise TranscriptionError(
+            "This call has no recording to transcribe."
+        ) from exc
+    except audio_service.LeadCallUnavailable as exc:
+        raise TranscriptionError(str(exc)) from exc
+    except LeadCallAPIError as exc:
+        raise TranscriptionNotConfigured(str(exc)) from exc
+    return data, source.mime_type
 
 
 # --------------------------------------------------------------------------
@@ -111,9 +131,9 @@ class VertexGeminiTranscriber:
         if not audio_bytes:
             raise TranscriptionError("The audio file is empty.")
 
+        # Duration comes from the CRM's durationSec; there is no ffprobe step
+        # any more and nothing here needs one.
         duration = source.duration_seconds
-        if duration is None and source.file_path:
-            duration = probe_duration(source.file_path)
 
         try:
             response = client.models.generate_content(

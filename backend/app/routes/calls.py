@@ -1,37 +1,42 @@
-"""Call ingestion, processing and read endpoints.
+"""Call endpoints: read a call, analyse it, stream its recording.
 
-Routes stay thin: validate the request, delegate to a service, map service
-errors onto HTTP status codes. The pipeline itself lives in
-services/call_analysis_service.py.
+There is no ingestion here any more. Calls arrive from the Lead Call API (the
+CRM), which already holds the recording and, for most analyzable calls, the
+transcript too. What is left is reading them and running our own analysis --
+the one thing the CRM does not do, which is turning "call back tomorrow at
+11 AM" into a scheduled follow-up datetime.
+
+Route ordering matters: literal paths are declared before `/{call_id}` so
+`/{call_id}` cannot swallow them.
 """
 
 import logging
-from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from pymongo.database import Database
 
 from app.config import settings
-from app.database import CALL_ANALYSES, CALL_TRANSCRIPTS, CALLERS, CALLS, LEADS, get_db
+from app.database import CALL_ANALYSES, CALL_TRANSCRIPTS, CALLS, get_db
 from app.models.analysis import CallAnalysis
-from app.models.call import Call, CallStatus, CallTranscript, SourceType
-from app.models.schemas import (
-    CallCreatedResponse,
-    CallFromTextRequest,
-    CallFromUrlRequest,
-    CallStatusResponse,
-    ProcessCallResponse,
-    ValidateUrlRequest,
-    ValidateUrlResponse,
-)
+from app.models.call import Call, CallStatus, CallTranscript
+from app.models.schemas import AnalyzeCallResponse
 from app.services import audio_service, call_analysis_service
-from app.services.audio_service import AudioValidationError
+from app.services.audio_service import RecordingNotAvailable
 from app.services.call_analysis_service import CallProcessingError
-from app.services.followup_service import compute_bucket, utcnow
+from app.services.followup_service import compute_bucket
+from app.services.lead_call_client import LeadCallAPIError, LeadCallUnavailable
 
 logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/calls", tags=["calls"])
+
+# Statuses that mean the pipeline is mid-flight for this call.
+IN_FLIGHT = {
+    CallStatus.PROCESSING.value,
+    CallStatus.TRANSCRIBING.value,
+    CallStatus.ANALYZING.value,
+}
 
 
 def _strip_id(doc: dict | None) -> dict | None:
@@ -42,215 +47,45 @@ def _strip_id(doc: dict | None) -> dict | None:
     return doc
 
 
-def _require_analyzer_enabled() -> None:
-    """Guard for every ingestion/processing endpoint.
-
-    Read endpoints (status, transcript, analysis, audio, list) stay open even
-    when disabled, so history already produced while the feature was on
-    remains viewable -- only new ingestion/processing is blocked.
-    """
-    if not settings.call_analyzer_enabled:
-        raise HTTPException(
-            status_code=403,
-            detail="Call analysis is disabled (CALL_ANALYZER_ENABLED is not set to true in "
-            "backend/.env).",
-        )
-
-
-def _require_mode_enabled(enabled: bool, env_var: str) -> None:
-    """Guard for one ingestion input mode (upload / URL / text).
-
-    Independent of `_require_analyzer_enabled` -- the feature as a whole can
-    be on while one specific input mode is turned off.
-    """
-    if not enabled:
-        raise HTTPException(
-            status_code=403,
-            detail=f"This input mode is disabled ({env_var} is not set to true in backend/.env).",
-        )
-
-
 def _get_call_or_404(db: Database, call_id: str) -> dict:
     call = db[CALLS].find_one({"call_id": call_id})
     if call is None:
-        raise HTTPException(status_code=404, detail=f"Call '{call_id}' not found")
+        raise HTTPException(status_code=404, detail=f"Call '{call_id}' was not found.")
     return call
 
 
-def _require_lead_and_caller(db: Database, lead_id: str, caller_id: str) -> tuple[dict, dict]:
-    lead = db[LEADS].find_one({"lead_id": lead_id})
-    if lead is None:
-        raise HTTPException(status_code=404, detail=f"Lead '{lead_id}' not found")
-    caller = db[CALLERS].find_one({"caller_id": caller_id})
-    if caller is None:
-        raise HTTPException(status_code=404, detail=f"Caller '{caller_id}' not found")
-    return lead, caller
-
-
-def _new_call_doc(lead_id: str, caller_id: str, source: audio_service.AudioSource) -> dict:
-    now = utcnow()
-    return {
-        "call_id": audio_service.new_call_id(),
-        "lead_id": lead_id,
-        "caller_id": caller_id,
-        "source_type": source.source_type,
-        "audio_url": source.url,
-        "audio_file_path": source.file_path,
-        "audio_mime": source.mime_type,
-        "audio_bytes": source.size_bytes,
-        "audio_filename": source.filename,
-        "duration_seconds": source.duration_seconds,
-        "status": CallStatus.UPLOADED.value,
-        "error": None,
-        "transcript_id": None,
-        "analysis_id": None,
-        # The recording is submitted right after the call, so "now" is the
-        # best available end time; the analyzer uses it to resolve "tomorrow".
-        "started_at": None,
-        "ended_at": now,
-        "created_at": now,
-        "processed_at": None,
-    }
-
-
-def _created(call: dict, message: str) -> dict:
-    return {
-        "call_id": call["call_id"],
-        "lead_id": call["lead_id"],
-        "caller_id": call["caller_id"],
-        "source_type": call["source_type"],
-        "status": call["status"],
-        "duration_seconds": call.get("duration_seconds"),
-        "audio_bytes": call.get("audio_bytes"),
-        "audio_filename": call.get("audio_filename"),
-        "message": message,
-    }
-
-
 # --------------------------------------------------------------------------
-# Ingestion
+# Analysis
 # --------------------------------------------------------------------------
 
 
-@router.post("/upload", response_model=CallCreatedResponse, status_code=201)
-def upload_call(
-    file: UploadFile = File(..., description="Audio recording (mp3, wav, m4a, ogg, webm)"),
-    lead_id: str = Form(...),
-    caller_id: str = Form(...),
-    db: Database = Depends(get_db),
-) -> dict:
-    """Accept an uploaded recording, store it, and create the call record."""
-    _require_analyzer_enabled()
-    _require_mode_enabled(settings.call_analyzer_upload_enabled, "CALL_ANALYZER_UPLOAD_ENABLED")
-    _require_lead_and_caller(db, lead_id, caller_id)
-    if settings.audio_storage_mode != "local":
+@router.post("/{call_id}/analyze", response_model=AnalyzeCallResponse)
+def analyze_call(call_id: str, db: Database = Depends(get_db)) -> dict:
+    """Analyse one existing call and apply the outcome to its lead.
+
+    Safe to re-run: a stored transcript is reused, so a retry only repeats the
+    step that actually failed, and re-analysing a call that is no longer the
+    lead's latest will not overwrite a newer outcome.
+    """
+    call = _get_call_or_404(db, call_id)
+
+    if call.get("status") in IN_FLIGHT:
+        raise HTTPException(status_code=409, detail=f"Call '{call_id}' is already being analysed.")
+
+    # Refuse up front rather than burning an LLM call on a call that cannot
+    # produce anything -- not connected, zero duration, or no source material.
+    if not (call.get("has_transcript") or call.get("has_recording") or call.get("transcript_id")):
         raise HTTPException(
             status_code=409,
-            detail="AUDIO_STORAGE_MODE is 'url'; file uploads are disabled. Use the Audio URL option.",
+            detail="This call has neither a transcript nor a recording, so there is nothing to analyse.",
         )
-
-    call_id = audio_service.new_call_id()
-    try:
-        source = audio_service.store_upload(file, call_id)
-    except AudioValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    call = _new_call_doc(lead_id, caller_id, source)
-    call["call_id"] = call_id
-    db[CALLS].insert_one(call)
-    return _created(call, "Audio uploaded and call record created. POST /process to analyze.")
-
-
-@router.post("/validate-url", response_model=ValidateUrlResponse)
-def validate_url(request: ValidateUrlRequest) -> dict:
-    """Confirm a URL is public, reachable and looks like audio -- without downloading it."""
-    _require_analyzer_enabled()
-    _require_mode_enabled(settings.call_analyzer_url_enabled, "CALL_ANALYZER_URL_ENABLED")
-    try:
-        return audio_service.validate_audio_url(request.audio_url)
-    except AudioValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@router.post("/from-url", response_model=CallCreatedResponse, status_code=201)
-def create_call_from_url(request: CallFromUrlRequest, db: Database = Depends(get_db)) -> dict:
-    """Create a call record that references a remote recording."""
-    _require_analyzer_enabled()
-    _require_mode_enabled(settings.call_analyzer_url_enabled, "CALL_ANALYZER_URL_ENABLED")
-    _require_lead_and_caller(db, request.lead_id, request.caller_id)
-    try:
-        meta = audio_service.validate_audio_url(request.audio_url)
-    except AudioValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    source = audio_service.source_from_url(request.audio_url, meta)
-    call = _new_call_doc(request.lead_id, request.caller_id, source)
-    db[CALLS].insert_one(call)
-    return _created(call, "Audio URL accepted and call record created. POST /process to analyze.")
-
-
-@router.post("/from-text", response_model=CallCreatedResponse, status_code=201)
-def create_call_from_text(request: CallFromTextRequest, db: Database = Depends(get_db)) -> dict:
-    """Create a call record from a transcript typed/pasted directly.
-
-    No audio and no transcription: the transcript document is created up
-    front and `transcript_id` is set on the call before it's even inserted,
-    so /process's existing transcript-reuse check skips straight to analysis.
-    """
-    _require_analyzer_enabled()
-    _require_mode_enabled(settings.call_analyzer_text_enabled, "CALL_ANALYZER_TEXT_ENABLED")
-    _require_lead_and_caller(db, request.lead_id, request.caller_id)
-
-    source = audio_service.AudioSource(
-        source_type=SourceType.TEXT.value,
-        file_path=None,
-        url=None,
-        mime_type="text/plain",
-        size_bytes=len(request.transcript.encode("utf-8")),
-        filename=None,
-        duration_seconds=None,
-    )
-    call = _new_call_doc(request.lead_id, request.caller_id, source)
-
-    transcript_doc = {
-        "transcript_id": audio_service.new_id("TR"),
-        "call_id": call["call_id"],
-        "lead_id": request.lead_id,
-        "caller_id": request.caller_id,
-        "transcript": request.transcript,
-        "language": None,
-        "duration_seconds": None,
-        "provider": "user_text",
-        "created_at": call["created_at"],
-    }
-    db[CALL_TRANSCRIPTS].insert_one(transcript_doc)
-    call["transcript_id"] = transcript_doc["transcript_id"]
-    db[CALLS].insert_one(call)
-    return _created(call, "Transcript received and call record created. POST /process to analyze.")
-
-
-# --------------------------------------------------------------------------
-# Processing
-# --------------------------------------------------------------------------
-
-
-@router.post("/{call_id}/process", response_model=ProcessCallResponse)
-def process_call(call_id: str, db: Database = Depends(get_db)) -> dict:
-    """Transcribe, analyze, store and update the lead. Synchronous.
-
-    Poll GET /api/calls/{call_id}/status while this runs to follow progress.
-    Safe to re-run: a failed call retries from the failed step, and a completed
-    call is re-analyzed (its transcript is reused).
-    """
-    _require_analyzer_enabled()
-    call = _get_call_or_404(db, call_id)
-    if call.get("status") in {CallStatus.PROCESSING.value, CallStatus.TRANSCRIBING.value, CallStatus.ANALYZING.value}:
-        raise HTTPException(status_code=409, detail=f"Call '{call_id}' is already being processed.")
 
     try:
         result = call_analysis_service.process_call(db, call)
     except CallProcessingError as exc:
-        # The service already recorded FAILED + the message on the call.
+        # The service already recorded the failure on the call itself.
+        if exc.stage is CallStatus.NOT_ANALYZABLE:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         status_code = 503 if exc.stage in (CallStatus.TRANSCRIBING, CallStatus.ANALYZING) else 422
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
@@ -260,12 +95,12 @@ def process_call(call_id: str, db: Database = Depends(get_db)) -> dict:
     follow_up["bucket"] = compute_bucket(follow_up).value
 
     if result.applied_to_lead:
-        message = "Call processed and lead updated."
+        message = "Call analysed and lead updated."
     else:
-        message = ("Call processed. The lead was not updated because a more recent call "
+        message = ("Call analysed. The lead was not updated because a more recent call "
                    "exists for this lead.")
     if result.degraded:
-        message += " Gemini was unavailable, so the deterministic fallback analyzer was used."
+        message += " The analysis model was unavailable, so the deterministic fallback was used."
 
     return {
         "call_id": call_id,
@@ -283,21 +118,6 @@ def process_call(call_id: str, db: Database = Depends(get_db)) -> dict:
     }
 
 
-@router.get("/{call_id}/status", response_model=CallStatusResponse)
-def get_call_status(call_id: str, db: Database = Depends(get_db)) -> dict:
-    """Lightweight poll target for the processing stepper."""
-    call = _get_call_or_404(db, call_id)
-    return {
-        "call_id": call_id,
-        "status": call.get("status"),
-        "error": call.get("error"),
-        "failed_stage": call.get("failed_stage"),
-        "transcript_id": call.get("transcript_id"),
-        "analysis_id": call.get("analysis_id"),
-        "processed_at": call.get("processed_at"),
-    }
-
-
 # --------------------------------------------------------------------------
 # Reads
 # --------------------------------------------------------------------------
@@ -307,7 +127,7 @@ def get_call_status(call_id: str, db: Database = Depends(get_db)) -> dict:
 @router.get("/", response_model=list[Call], include_in_schema=False)
 def list_calls(lead_id: str | None = None, db: Database = Depends(get_db)) -> list[dict]:
     query = {"lead_id": lead_id} if lead_id else {}
-    return [_strip_id(c) for c in db[CALLS].find(query).sort("created_at", -1)]
+    return [_strip_id(c) for c in db[CALLS].find(query).sort("call_time", -1)]
 
 
 @router.get("/{call_id}", response_model=Call)
@@ -320,7 +140,7 @@ def get_call_transcript(call_id: str, db: Database = Depends(get_db)) -> dict:
     _get_call_or_404(db, call_id)
     transcript = db[CALL_TRANSCRIPTS].find_one({"call_id": call_id}, sort=[("created_at", -1)])
     if transcript is None:
-        raise HTTPException(status_code=404, detail=f"Call '{call_id}' has no transcript yet.")
+        raise HTTPException(status_code=404, detail=f"Call '{call_id}' has no transcript.")
     return _strip_id(transcript)
 
 
@@ -338,7 +158,7 @@ def get_call_analysis(call_id: str, db: Database = Depends(get_db)) -> dict:
     if analysis is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Call '{call_id}' has not been analyzed yet. POST to /process first.",
+            detail=f"Call '{call_id}' has not been analysed yet.",
         )
     return _strip_id(analysis)
 
@@ -352,25 +172,38 @@ def get_call_analyses(call_id: str, db: Database = Depends(get_db)) -> list[dict
 
 @router.get("/{call_id}/audio", include_in_schema=True)
 def get_call_audio(call_id: str, db: Database = Depends(get_db)):
-    """Serve the recording for playback. The browser never sees a filesystem path."""
+    """Stream the recording, fetching it from the CRM on first request.
+
+    Deliberately NOT a redirect to the CRM: a browser cannot attach the
+    `X-API-Key` header to an <audio src>, so a redirect yields 401. The first
+    request buffers the audio to disk and every later one serves the cached
+    file, which also restores the duration and seeking that upstream's missing
+    content-length and Range support would otherwise cost.
+    """
     if not settings.audio_playback_enabled:
-        raise HTTPException(status_code=404, detail="Audio playback is disabled (AUDIO_PLAYBACK_ENABLED=false).")
+        raise HTTPException(
+            status_code=404, detail="Audio playback is disabled (AUDIO_PLAYBACK_ENABLED=false)."
+        )
+
     call = _get_call_or_404(db, call_id)
 
-    if call.get("source_type") == SourceType.URL.value and call.get("audio_url"):
-        return RedirectResponse(call["audio_url"], status_code=307)
+    if not call.get("has_recording"):
+        raise HTTPException(status_code=404, detail="This call has no recording.")
 
-    stored = call.get("audio_file_path")
-    if not stored:
-        raise HTTPException(status_code=404, detail="This call has no stored audio.")
-    path = Path(stored).resolve()
-    # Defence in depth: only serve files that live inside the upload directory.
-    upload_root = settings.upload_path.resolve()
-    if upload_root not in path.parents or not path.is_file():
-        raise HTTPException(status_code=404, detail="Audio file is not available.")
+    try:
+        recording = audio_service.fetch_recording(call_id, call.get("crm_call_id"))
+    except RecordingNotAvailable as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except LeadCallUnavailable as exc:
+        # The CRM or its telephony provider was unreachable -- retryable.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LeadCallAPIError as exc:
+        # Missing/invalid/revoked key: an operator problem, never a 500.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     return FileResponse(
-        path,
-        media_type=call.get("audio_mime") or "audio/mpeg",
-        filename=call.get("audio_filename") or path.name,
+        recording.path,
+        media_type=audio_service.AUDIO_MIME,
+        filename=f"{call_id}.mp3",
         content_disposition_type="inline",
     )

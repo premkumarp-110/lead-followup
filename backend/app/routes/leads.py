@@ -25,6 +25,9 @@ ACTIVE_FOLLOW_UP_QUERY = {
     "follow_up.status": FollowUpStatus.PENDING.value,
 }
 
+# The follow_up.status clause matches HISTORICAL rows only -- COMPLETE and
+# CANCEL are retired, so no new document can reach those statuses. Kept so
+# leads closed before the change stay visible in this list.
 CLOSED_QUERY = {
     "$or": [
         {"lead_status": {"$in": [LeadStatus.CONVERTED.value, LeadStatus.DROPPED.value]}},
@@ -49,7 +52,7 @@ def _get_lead_or_404(db: Database, lead_id: str) -> dict:
 
 
 def _latest_call(db: Database, lead_id: str) -> dict | None:
-    return db[CALLS].find_one({"lead_id": lead_id}, sort=[("ended_at", -1), ("created_at", -1)])
+    return db[CALLS].find_one({"lead_id": lead_id}, sort=[("end_time", -1), ("created_at", -1)])
 
 
 def _latest_analysis(db: Database, lead: dict) -> dict | None:
@@ -106,7 +109,13 @@ def list_closed(
     filters: LeadFilters = Depends(lead_filters),
     db: Database = Depends(get_db),
 ) -> list[dict]:
-    """Converted, dropped, and leads whose follow-up was completed or cancelled."""
+    """Leads that are done with: converted or dropped.
+
+    The `follow_up.status` half of CLOSED_QUERY now only ever matches historical
+    rows -- COMPLETE and CANCEL are retired, so nothing writes those statuses
+    any more. New leads arrive here via `lead_status` when a call analysis
+    concludes CONVERTED or DROPPED.
+    """
     query = filters.mongo_query(CLOSED_QUERY)
     docs = list(db[LEADS].find(query).sort("updated_at", -1))
     now = utcnow()
@@ -128,6 +137,11 @@ def get_lead(lead_id: str, db: Database = Depends(get_db)) -> dict:
     caller = (
         db[CALLERS].find_one({"caller_id": call["caller_id"]}) if call and call.get("caller_id") else None
     )
+    # Every call, so the modal can offer Analyse per call rather than only on
+    # the newest one -- a lead often has an analysed call and an unanalysed one.
+    detail["calls"] = [
+        _strip_id(c) for c in db[CALLS].find({"lead_id": lead_id}).sort("call_time", -1)
+    ]
     detail["latest_call"] = _strip_id(call)
     detail["latest_caller"] = _strip_id(caller)
     detail["latest_transcript"] = _strip_id(_latest_transcript(db, lead_id, call))
@@ -138,7 +152,7 @@ def get_lead(lead_id: str, db: Database = Depends(get_db)) -> dict:
 @router.get("/{lead_id}/calls", response_model=list[Call])
 def get_lead_calls(lead_id: str, db: Database = Depends(get_db)) -> list[dict]:
     _get_lead_or_404(db, lead_id)
-    return [_strip_id(c) for c in db[CALLS].find({"lead_id": lead_id}).sort("created_at", -1)]
+    return [_strip_id(c) for c in db[CALLS].find({"lead_id": lead_id}).sort("call_time", -1)]
 
 
 @router.get("/{lead_id}/latest-transcript", response_model=CallTranscript)
@@ -170,7 +184,12 @@ def update_follow_up(
     request: FollowUpActionRequest,
     db: Database = Depends(get_db),
 ) -> dict:
-    """Mark done / cancel / reschedule a follow-up. A reason is always required."""
+    """Reschedule a follow-up. A reason is always required.
+
+    Reschedule is the only action a BD can take: closing a follow-up is driven
+    by call analysis, not by asserting it is done. COMPLETE and CANCEL are
+    refused with a 422.
+    """
     lead = _get_lead_or_404(db, lead_id)
     try:
         followup_service.apply_followup_action(db, lead, request)

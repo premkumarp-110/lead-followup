@@ -2,12 +2,26 @@
 
 This is the ONLY module that knows the order of the steps:
 
-    load call -> get audio -> TRANSCRIBING -> store transcript
+    load call -> TRANSCRIBING (skipped when a transcript already exists)
               -> ANALYZING -> validate -> store analysis -> update lead -> COMPLETED
 
 Each step is delegated to a single-purpose service. The orchestrator persists
-the call's `status` at every transition, so a client can poll
-GET /api/calls/{id}/status while POST /process is still running.
+the call's `status` at every transition.
+
+Two shortcuts matter, both driven by what the CRM already did:
+
+  * **Transcription is skipped when the call has one.** Around 55% of analyzable
+    calls arrive with `has_transcript` set, and transcription is the slowest and
+    most expensive stage. The existing `transcript_id` short-circuit does this.
+  * **The CRM's own `analysis_summary` is handed to the LLM when present** (~37%
+    of calls). It already contains a summary, a pitch score and a fixed
+    question/answer block. What it never contains is a follow-up *datetime* --
+    "What follow-up action was locked in?" is prose like "call back tomorrow at
+    11 AM". Extracting a concrete datetime from that is the narrow job left.
+
+A call that cannot be analyzed at all -- not connected, zero duration, or
+neither transcript nor recording -- is rejected up front rather than burning an
+LLM call. That is ~30% of real calls.
 
 Running this in a background worker later means calling `process_call()` from
 the worker instead of the request handler. Nothing else changes.
@@ -22,7 +36,8 @@ from app.database import CALL_ANALYSES, CALL_TRANSCRIPTS, CALLERS, CALLS, LEADS
 from app.models.analysis import AnalysisStatus, CallAnalysisResult
 from app.models.call import CallStatus
 from app.services import followup_service, llm_service, transcription_service
-from app.services.audio_service import AudioSource, AudioValidationError, new_id
+from app.services.audio_service import AudioValidationError, new_id
+from app.services.transcription_service import AudioSource
 from app.services.followup_service import utcnow
 from app.services.llm_service import AnalysisAttempt, LLMAnalysisError
 from app.services.transcription_service import TranscriptionError
@@ -66,14 +81,16 @@ def _fail(db: Database, call_id: str, stage: CallStatus, message: str) -> CallPr
 
 def _audio_source(call: dict) -> AudioSource:
     return AudioSource(
-        source_type=call.get("source_type") or "UPLOAD",
-        file_path=call.get("audio_file_path"),
-        url=call.get("audio_url"),
-        mime_type=call.get("audio_mime") or "audio/mpeg",
-        size_bytes=call.get("audio_bytes"),
-        filename=call.get("audio_filename"),
-        duration_seconds=call.get("duration_seconds"),
+        call_id=call["call_id"],
+        crm_call_id=call.get("crm_call_id"),
+        duration_seconds=call.get("duration_sec"),
     )
+
+
+def _crm_analysis(call: dict) -> dict | None:
+    """The CRM's own parsed analysis for this call, when it has one."""
+    parsed = call.get("analysis_summary_parsed")
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _analysis_doc(call: dict, attempt: AnalysisAttempt) -> dict:
@@ -102,6 +119,7 @@ def _analysis_doc(call: dict, attempt: AnalysisAttempt) -> dict:
                 "summary": result.summary,
                 "key_points": result.key_points,
                 "confidence": result.confidence,
+                "sentiment": result.sentiment.model_dump(mode="json"),
             }
         )
     else:
@@ -114,6 +132,9 @@ def _analysis_doc(call: dict, attempt: AnalysisAttempt) -> dict:
                 "summary": None,
                 "key_points": [],
                 "confidence": None,
+                # Explicit null, not an absent key: a failed attempt must have
+                # the same shape as a successful one or readers have to guess.
+                "sentiment": None,
             }
         )
     return doc
@@ -127,6 +148,21 @@ def _analysis_doc(call: dict, attempt: AnalysisAttempt) -> dict:
 def process_call(db: Database, call: dict) -> ProcessResult:
     """Run the full pipeline for one call record. Synchronous."""
     call_id = call["call_id"]
+
+    # Nothing to work with: a not-connected, zero-duration call with neither a
+    # transcript nor a recording. Record it as such rather than failing -- it is
+    # an honest terminal state, not a pipeline error.
+    if not (call.get("has_transcript") or call.get("has_recording") or call.get("transcript_id")):
+        _set_status(
+            db, call_id, CallStatus.NOT_ANALYZABLE,
+            error="This call has neither a transcript nor a recording.",
+            failed_stage=None,
+        )
+        raise CallProcessingError(
+            "This call has neither a transcript nor a recording, so there is nothing to analyze.",
+            CallStatus.NOT_ANALYZABLE,
+        )
+
     lead = db[LEADS].find_one({"lead_id": call["lead_id"]})
     if lead is None:
         raise _fail(db, call_id, CallStatus.PROCESSING, f"Lead '{call['lead_id']}' no longer exists.")
@@ -141,8 +177,9 @@ def process_call(db: Database, call: dict) -> ProcessResult:
         if call.get("transcript_id") else None
     )
     if existing_transcript is not None:
-        # Re-processing an already-transcribed call: reuse the transcript so a
-        # retry only repeats the step that failed.
+        # Either the CRM shipped a transcript with the call, or this is a retry
+        # of an already-transcribed call. Either way, skip the expensive step --
+        # a retry then only repeats what actually failed.
         transcript_doc = existing_transcript
     else:
         try:
@@ -163,25 +200,31 @@ def process_call(db: Database, call: dict) -> ProcessResult:
             "caller_id": call.get("caller_id"),
             "transcript": result.text,
             "language": result.language,
-            "duration_seconds": result.duration_seconds or call.get("duration_seconds"),
+            "duration_seconds": result.duration_seconds or call.get("duration_sec"),
             "provider": result.provider,
+            "source": None,
             "created_at": utcnow(),
         }
         db[CALL_TRANSCRIPTS].insert_one(transcript_doc)
-        updates = {"transcript_id": transcript_doc["transcript_id"]}
-        if not call.get("duration_seconds") and result.duration_seconds:
-            updates["duration_seconds"] = result.duration_seconds
+        updates = {"transcript_id": transcript_doc["transcript_id"], "has_transcript": True}
+        if not call.get("duration_sec") and result.duration_seconds:
+            updates["duration_sec"] = result.duration_seconds
         db[CALLS].update_one({"call_id": call_id}, {"$set": updates})
         call = {**call, **updates}
 
     # ---- 2. Analyze ----------------------------------------------------------
     _set_status(db, call_id, CallStatus.ANALYZING)
-    lead_data = {k: lead.get(k) for k in ("lead_id", "name", "course", "lead_status", "assigned_bd")}
+    lead_data = {
+        k: lead.get(k)
+        for k in ("lead_id", "product", "stage", "language", "lead_status", "owner_name")
+    }
     caller_data = {k: caller.get(k) for k in ("caller_id", "name", "role")} if caller else None
     try:
         run = llm_service.analyze_conversation(
             transcript_doc["transcript"], lead_data, caller_data,
-            call_ended_at=call.get("ended_at") or call.get("created_at"),
+            call_ended_at=call.get("end_time") or call.get("call_time") or call.get("created_at"),
+            direction=call.get("direction"),
+            crm_analysis=_crm_analysis(call),
         )
     except LLMAnalysisError as exc:
         # Persist the failed attempt(s) is handled below via run; here nothing

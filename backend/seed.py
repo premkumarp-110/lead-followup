@@ -1,27 +1,53 @@
-"""Seed MongoDB with realistic sample data.
+"""Seed MongoDB with mock data in the Lead Call API's shape.
 
 Run:  .venv/bin/python seed.py
 
-Drops and recreates the five collections, then inserts 15 leads, 5 callers,
-17 calls, 17 transcripts and 17 analyses. Analyses are PRE-BAKED documents
-(model = "seed") -- no Vertex AI calls are made, so reseeding is instant, free
-and works offline. Live Gemini analysis is exercised by uploading a real
-recording through the dashboard.
+Drops and recreates every collection, then inserts 60 leads, 12 callers,
+40 calls, their transcripts and pre-baked analyses. No API calls and no LLM
+calls are made, so reseeding is instant, free and works offline.
 
-Follow-up times are generated relative to "now", so the Due Today / Overdue /
-Upcoming buckets are always populated whenever you reseed.
+**The records are mock; the *shape* and the *distributions* are real.** Every
+field the CRM returns is stored, and stage/product/source/language mixes follow
+frequencies measured against the live API. That matters because filtering is
+driven from this data alone.
 
-Seeded calls have transcripts but no audio file (they were never uploaded), so
-the modal shows "recording not available" for them. That is expected.
+**Every seeded BDA shares one mailbox** (`SEED_CALLER_EMAIL`). The reminder digest emails
+a BD at their own address, and the CRM's real owners are live `@hclguvi.com` mailboxes --
+seeding those would point a working SMTP scheduler at actual colleagues. Names stay realistic;
+the address does not. Because the address no longer identifies a BD, the UI filters on
+`caller_id`; `?bd=<email>` now legitimately matches every seeded lead.
+
+Three properties of real data are reproduced deliberately:
+
+  * **No name, phone or email.** The CRM exposes none. A lead is its `lead_id`
+    plus `external_id`, with product/stage/owner as context.
+  * **`conversion_date`, `sales_qualified` and `sales_owner_*` are null on every
+    lead**, because they are null on every real lead. Nothing is invented to
+    fill a column that is empty upstream.
+  * **Transcript implies recording.** There is no call with a transcript but no
+    audio, and the not-connected / zero-duration calls have neither.
+
+Follow-up datetimes are generated relative to "now", so the Overdue / Due /
+Upcoming / Unscheduled buckets are always populated after a reseed.
+
+Calls that carry a recording borrow a real CRM `callId` from
+fixtures/crm_recording_ids.json into `crm_call_id`, purely so audio playback
+resolves. Nothing else about a seeded call comes from the CRM, and a missing
+fixture only costs playback.
 """
 
+import json
+import random
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import seed_data as V
 from app.database import (
     CALL_ANALYSES,
     CALL_TRANSCRIPTS,
     CALLERS,
     CALLS,
+    FOLLOWUP_ALERTS,
     LEADS,
     close_client,
     ensure_indexes,
@@ -30,493 +56,683 @@ from app.database import (
 )
 from app.models.analysis import NO_DATE_REASON, CallAnalysisResult
 from app.models.call import CallStatus, Outcome
+from app.models.caller import Caller
 from app.models.lead import LeadStatus
 from app.services import followup_service
+from app.services.stage_mapping import map_stage
 
 NOW = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 IST = timezone(timedelta(hours=5, minutes=30))
 SEED_MODEL = "seed"
+CRM_SOURCE = "transcript_content"
+
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "crm_recording_ids.json"
+
+# Deterministic: reseeding twice gives the same dataset, so a bug is reproducible.
+rng = random.Random(20260923)
+
 
 # --------------------------------------------------------------------------
-# Callers / BDs (5)
+# Helpers
 # --------------------------------------------------------------------------
-
-CALLERS_SPEC = [
-    {"caller_id": "BD001", "name": "Priya Raman", "role": "Senior BD Executive",
-     "email": "priya.raman@edtech.example", "phone": "+919600011001"},
-    {"caller_id": "BD002", "name": "Rahul Nair", "role": "BD Executive",
-     "email": "rahul.nair@edtech.example", "phone": "+919600011002"},
-    {"caller_id": "BD003", "name": "Arun Prasad", "role": "BD Executive",
-     "email": "arun.prasad@edtech.example", "phone": "+919600011003"},
-    {"caller_id": "BD004", "name": "Meera Krishnan", "role": "BD Executive",
-     "email": "meera.k@edtech.example", "phone": "+919600011004"},
-    {"caller_id": "BD005", "name": "Suresh Babu", "role": "BD Trainee",
-     "email": "suresh.babu@edtech.example", "phone": "+919600011005"},
-]
-BD = {c["caller_id"]: {"id": c["caller_id"], "name": c["name"].split()[0]} for c in CALLERS_SPEC}
-
-FULL_STACK = "Full Stack Development"
-DATA_SCIENCE = "Data Science"
-AI_ML = "AI/ML"
-CLOUD = "Cloud Computing"
-CYBER = "Cyber Security"
-ANALYTICS = "Data Analytics"
-
 
 def when(**kwargs) -> datetime:
     return NOW + timedelta(**kwargs)
 
 
-def spoken(target: datetime) -> str:
-    """Render a follow-up time the way a lead would say it on a call (in IST)."""
-    local = target.astimezone(IST)
-    return f"{local.day} {local:%B} at {local:%I:%M %p}".replace(" 0", " ")
+def weighted(choices: list[tuple]) -> object:
+    """Pick from [(value, weight), ...] using the live frequency weights."""
+    values = [c[0] for c in choices]
+    weights = [c[1] for c in choices]
+    return rng.choices(values, weights=weights, k=1)[0]
+
+
+def superleap_id() -> str:
+    """A Superleap-style id: WN5qOX_ plus 8 mixed-case alphanumerics."""
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return "WN5qOX_" + "".join(rng.choice(alphabet) for _ in range(8))
+
+
+def guid() -> str:
+    """A LeadSquared-style GUID."""
+    hexc = "0123456789abcdef"
+    def block(n: int) -> str:
+        return "".join(rng.choice(hexc) for _ in range(n))
+    return f"{block(8)}-{block(4)}-{block(4)}-{block(4)}-{block(12)}"
+
+
+def load_recording_ids() -> list[str]:
+    """Real CRM callIds with recordings. Absent fixture just costs playback."""
+    try:
+        data = json.loads(FIXTURE.read_text())
+        return list(data.get("call_ids") or [])
+    except (OSError, ValueError):
+        print(f"  ! {FIXTURE.name} not found -- seeded calls will have no playable audio.")
+        return []
 
 
 # --------------------------------------------------------------------------
-# Lead + call definitions
-#
-# Each call carries the transcript and the pre-baked analysis that a Gemini
-# run over that transcript would produce. `target` is the follow-up moment
-# the transcript asks for (None for converted / dropped / unscheduled).
+# Callers
 # --------------------------------------------------------------------------
 
-LEADS_SPEC = [
-    # ---------------- OVERDUE ----------------
-    {
-        "lead_id": "L001", "name": "Arun Kumar", "phone": "+919840112233",
-        "email": "arun.kumar@example.com", "course": FULL_STACK, "bd": "BD001",
-        "created": when(days=-6), "expect": "OVERDUE",
-        "calls": [{
-            "caller": "BD001", "ended": when(days=-3, hours=-1), "duration": 504,
-            "target": when(hours=-2),
-            "text": ("BD: Hi Arun, this is Priya from the admissions team. Did you get a chance to look "
-                     "at the Full Stack Development brochure?\n"
-                     "Lead: Yes, I went through it. I am interested in the Full Stack Development course. "
-                     "The curriculum looks good but I need to discuss the fees with my parents.\n"
-                     "BD: Sure. Would it help if I shared the EMI options?\n"
-                     "Lead: Yes please send them. Please call me on {when} once I have spoken to them."),
-            "intent": "NEEDS_TIME", "confidence": 0.93,
-            "summary": "Arun is interested in Full Stack Development but must discuss the fees with his "
-                       "parents before committing. He asked for a callback at a specific time.",
-            "key_points": ["Interested in Full Stack Development", "Needs to discuss fees with parents",
-                           "Asked for EMI options", "Requested a callback at a specific time"],
-            "reason": "Lead wants to discuss fees with parents and asked for a callback.",
-        }],
-    },
-    {
-        "lead_id": "L002", "name": "Divya S", "phone": "+919840223344",
-        "email": "divya.s@example.com", "course": DATA_SCIENCE, "bd": "BD002",
-        "created": when(days=-8), "expect": "OVERDUE",
-        "calls": [{
-            "caller": "BD002", "ended": when(days=-4), "duration": 372,
-            "target": when(days=-1, hours=-3),
-            "text": ("Lead: The Data Science syllabus looks good, especially the capstone projects. "
-                     "I am travelling for work this week so I cannot decide right now.\n"
-                     "BD: No problem Divya. When would be a good time to reconnect?\n"
-                     "Lead: Please call me on {when}. I will have a clearer picture by then."),
-            "intent": "INTERESTED", "confidence": 0.91,
-            "summary": "Divya likes the Data Science syllabus but is travelling and deferred the decision "
-                       "to a specific callback time.",
-            "key_points": ["Positive about the Data Science syllabus", "Travelling this week",
-                           "Requested callback at a specific date and time"],
-            "reason": "Lead is travelling and asked to be called back at a set time.",
-        }],
-    },
-    {
-        "lead_id": "L003", "name": "Vignesh P", "phone": "+919840334455",
-        "email": "vignesh.p@example.com", "course": CLOUD, "bd": "BD002",
-        "created": when(days=-10), "expect": "OVERDUE",
-        "calls": [
-            {"caller": "BD002", "ended": when(days=-9), "duration": 128, "target": when(days=-6),
-             "text": ("Lead: I just saw your message about the Cloud Computing program. I am in office "
-                      "right now, can you call me on {when}?\nBD: Of course, I will call you then."),
-             "intent": "INTERESTED", "confidence": 0.88,
-             "summary": "Brief first contact; Vignesh asked to be called back at a specific time.",
-             "key_points": ["Initial enquiry about Cloud Computing", "Busy at work, requested callback"],
-             "reason": "Lead requested a callback at a specific time."},
-            {"caller": "BD002", "ended": when(days=-6), "duration": 641, "target": when(days=-3, hours=-5),
-             "text": ("Lead: Thanks for the detailed walkthrough. I want to compare the AWS and Azure "
-                      "tracks before deciding, and check which one my company prefers.\n"
-                      "BD: Both tracks share the first four modules, so you can switch later too.\n"
-                      "Lead: Good to know. Get back to me on {when} and I will confirm the track."),
-             "intent": "INTERESTED", "confidence": 0.9,
-             "summary": "Vignesh is comparing the AWS and Azure tracks and checking his employer's "
-                        "preference before choosing. He set a specific follow-up time.",
-             "key_points": ["Comparing AWS vs Azure tracks", "Checking employer preference",
-                            "Will confirm track at the follow-up"],
-             "reason": "Lead is choosing between tracks and asked for a follow-up call."},
-        ],
-    },
-    # ---------------- DUE TODAY ----------------
-    {
-        "lead_id": "L004", "name": "Sneha M", "phone": "+919840445566",
-        "email": "sneha.m@example.com", "course": AI_ML, "bd": "BD001",
-        "created": when(days=-4), "expect": "DUE",
-        "calls": [{
-            "caller": "BD001", "ended": when(hours=-5), "duration": 455, "target": when(minutes=45),
-            "text": ("Lead: The AI/ML placement support sounds useful. I am in a meeting right now though.\n"
-                     "BD: Understood Sneha, I will keep it short. Shall I call back later today?\n"
-                     "Lead: Yes, please call me on {when}. I want to ask about the mentor sessions."),
-            "intent": "INTERESTED", "confidence": 0.9,
-            "summary": "Sneha is interested in AI/ML, particularly the placement support, and asked for a "
-                       "short callback later the same day to discuss mentor sessions.",
-            "key_points": ["Interested in AI/ML placement support", "Wants details on mentor sessions",
-                           "Callback requested later today"],
-            "reason": "Lead was in a meeting and asked for a callback later today.",
-        }],
-    },
-    {
-        "lead_id": "L005", "name": "Mohammed Irfan", "phone": "+919840556677",
-        "email": "m.irfan@example.com", "course": CYBER, "bd": "BD004",
-        "created": when(days=-5), "expect": "DUE",
-        "calls": [{
-            "caller": "BD004", "ended": when(hours=-7), "duration": 289, "target": when(minutes=95),
-            "text": ("Lead: I want to know about the Cyber Security lab access and whether there are EMI "
-                     "options. The upfront fee is a bit high for me.\n"
-                     "BD: We do have a no-cost EMI plan. I can walk you through it.\n"
-                     "Lead: Please call me on {when} and explain the EMI plan in detail."),
-            "intent": "PRICE_SENSITIVE", "confidence": 0.92,
-            "summary": "Irfan is interested in Cyber Security but finds the upfront fee high and wants the "
-                       "EMI plan explained in a follow-up call.",
-            "key_points": ["Asked about lab access", "Upfront fee is a concern", "Wants EMI plan explained"],
-            "reason": "Lead asked for EMI details in a follow-up call.",
-        }],
-    },
-    # ---------------- UPCOMING ----------------
-    {
-        "lead_id": "L006", "name": "Keerthana Iyer", "phone": "+919840667788",
-        "email": "keerthana.iyer@example.com", "course": ANALYTICS, "bd": "BD003",
-        "created": when(days=-3), "expect": "UPCOMING",
-        "calls": [{
-            "caller": "BD003", "ended": when(hours=-20), "duration": 612, "target": when(days=1, hours=2),
-            "text": ("Lead: Data Analytics looks like the right fit for my career switch. I will discuss "
-                     "with my manager about study leave and let you know.\n"
-                     "BD: Great. When should I follow up?\n"
-                     "Lead: Please call me on {when}."),
-            "intent": "INTERESTED", "confidence": 0.9,
-            "summary": "Keerthana sees Data Analytics as a fit for a career switch and will check study "
-                       "leave with her manager before the agreed callback.",
-            "key_points": ["Career switch into Data Analytics", "Checking study leave with manager",
-                           "Callback scheduled"],
-            "reason": "Lead is confirming study leave and asked for a callback.",
-        }],
-    },
-    {
-        "lead_id": "L007", "name": "Rohit S", "phone": "+919840778899",
-        "email": "rohit.s@example.com", "course": FULL_STACK, "bd": "BD002",
-        "created": when(days=-2), "expect": "UPCOMING",
-        "calls": [{
-            "caller": "BD002", "ended": when(hours=-30), "duration": 337, "target": when(days=1, hours=8),
-            "text": ("Lead: I want to join the Full Stack Development batch, but I haven't made the payment "
-                     "yet. My salary comes in on Friday.\n"
-                     "BD: That's fine Rohit, the seat is held for a week.\n"
-                     "Lead: Thanks. Please call me on {when} and I will complete the payment on the call."),
-            "intent": "READY_TO_ENROLL", "confidence": 0.94,
-            "summary": "Rohit has decided to join Full Stack Development but has not paid yet; he asked for "
-                       "a callback to complete payment.",
-            "key_points": ["Decided to join", "Payment pending until salary date",
-                           "Callback scheduled to complete payment"],
-            "reason": "Payment pending; lead asked for a callback to complete it.",
-        }],
-    },
-    {
-        "lead_id": "L008", "name": "Priyanka Menon", "phone": "+919840889900",
-        "email": "priyanka.menon@example.com", "course": DATA_SCIENCE, "bd": "BD004",
-        "created": when(days=-12), "expect": "UPCOMING",
-        "calls": [{
-            "caller": "BD004", "ended": when(days=-1, hours=-2), "duration": 218, "target": when(days=6, hours=3),
-            "text": ("Lead: My notice period ends this month, so I am very busy with handover right now.\n"
-                     "BD: Understood. Would you like me to reach out after that?\n"
-                     "Lead: Yes, please call me on {when}. I do want to start Data Science before my new job."),
-            "intent": "INTERESTED", "confidence": 0.89,
-            "summary": "Priyanka is finishing her notice period and asked to be contacted next week, "
-                       "intending to start Data Science before her new job.",
-            "key_points": ["Busy with notice period handover", "Wants to start before new job",
-                           "Callback next week"],
-            "reason": "Lead is busy until end of notice period and asked for a callback.",
-        }],
-    },
-    # ---------------- UNSCHEDULED (follow-up required, no date given) ----------------
-    {
-        "lead_id": "L014", "name": "Naveen B", "phone": "+919841445566",
-        "email": "naveen.b@example.com", "course": FULL_STACK, "bd": "BD005",
-        "created": when(days=-2), "expect": "UNSCHEDULED",
-        "calls": [{
-            "caller": "BD005", "ended": when(hours=-4), "duration": 402, "target": None,
-            "text": ("Lead: The course looks interesting. Let me discuss it with my family and I will "
-                     "get back to you.\nBD: Sure Naveen. Is there a good time for me to call?\n"
-                     "Lead: I am not sure yet, I will let you know."),
-            "intent": "NEEDS_TIME", "confidence": 0.87,
-            "summary": "Naveen is interested in Full Stack Development but wants to discuss with family "
-                       "first. He did not commit to a callback time.",
-            "key_points": ["Interested in the course", "Wants to discuss with family",
-                           "No callback time specified"],
-            "reason": NO_DATE_REASON,
-        }],
-    },
-    # ---------------- CONVERTED ----------------
-    {
-        "lead_id": "L009", "name": "Karthik R", "phone": "+919840990011",
-        "email": "karthik.r@example.com", "course": AI_ML, "bd": "BD001",
-        "created": when(days=-14), "expect": "CONVERTED",
-        "calls": [{
-            "caller": "BD001", "ended": when(hours=-26), "duration": 731, "target": None,
-            "text": ("Lead: I have completed the payment and I would like to proceed with the AI/ML course.\n"
-                     "BD: Congratulations Karthik! You will receive the onboarding mail within an hour.\n"
-                     "Lead: Perfect, thank you."),
-            "intent": "READY_TO_ENROLL", "confidence": 0.97,
-            "summary": "Karthik confirmed payment is complete and wants to proceed with AI/ML. Enrollment "
-                       "is done.",
-            "key_points": ["Payment completed", "Confirmed enrollment in AI/ML", "Onboarding mail promised"],
-        }],
-    },
-    {
-        "lead_id": "L010", "name": "Aishwarya Nair", "phone": "+919841001122",
-        "email": "aishwarya.nair@example.com", "course": DATA_SCIENCE, "bd": "BD003",
-        "created": when(days=-11), "expect": "CONVERTED",
-        "calls": [{
-            "caller": "BD003", "ended": when(days=-2), "duration": 566, "target": None,
-            "text": ("Lead: I have decided to join the Data Science program. Please send me the enrollment "
-                     "details and the payment link.\nBD: Sending them right now, Aishwarya."),
-            "intent": "READY_TO_ENROLL", "confidence": 0.95,
-            "summary": "Aishwarya decided to join Data Science and asked for enrollment details and the "
-                       "payment link.",
-            "key_points": ["Decided to join Data Science", "Requested enrollment details and payment link"],
-        }],
-    },
-    {
-        "lead_id": "L011", "name": "Ramesh V", "phone": "+919841112233",
-        "email": "ramesh.v@example.com", "course": CLOUD, "bd": "BD004",
-        "created": when(days=-9), "expect": "CONVERTED",
-        "calls": [
-            {"caller": "BD004", "ended": when(days=-5), "duration": 402, "target": when(days=-3),
-             "text": ("Lead: The Cloud Computing course fits my plan for a DevOps role. Please call me on "
-                      "{when} after I check with my team lead."),
-             "intent": "INTERESTED", "confidence": 0.9,
-             "summary": "Ramesh finds Cloud Computing a fit and will confirm after speaking to his team lead.",
-             "key_points": ["Targeting a DevOps role", "Checking with team lead", "Callback scheduled"],
-             "reason": "Lead is checking with team lead and asked for a callback."},
-            {"caller": "BD004", "ended": when(days=-3, hours=2), "duration": 295, "target": None,
-             "text": ("Lead: My team lead is fine with it. I want to enroll in the Cloud Computing course. "
-                      "I have paid the fees just now through the link.\nBD: Received, Ramesh. Welcome aboard!"),
-             "intent": "READY_TO_ENROLL", "confidence": 0.96,
-             "summary": "Ramesh confirmed enrollment in Cloud Computing and has paid the fees.",
-             "key_points": ["Team lead approved", "Paid the fees", "Enrollment confirmed"]},
-        ],
-    },
-    # ---------------- DROPPED ----------------
-    {
-        "lead_id": "L012", "name": "Anitha V", "phone": "+919841223344",
-        "email": "anitha.v@example.com", "course": CYBER, "bd": "BD005",
-        "created": when(days=-15), "expect": "DROPPED",
-        "calls": [
-            {"caller": "BD005", "ended": when(days=-8), "duration": 240, "target": when(days=-5),
-             "text": ("Lead: I am considering Cyber Security but also looking at another institute. Call me "
-                      "on {when} and I will tell you my decision."),
-             "intent": "INTERESTED", "confidence": 0.85,
-             "summary": "Anitha is comparing the Cyber Security course with another institute.",
-             "key_points": ["Comparing with another institute", "Callback scheduled for decision"],
-             "reason": "Lead is comparing options and asked for a callback."},
-            {"caller": "BD005", "ended": when(days=-5, hours=1), "duration": 96, "target": None,
-             "text": ("Lead: I have decided not to join the course. I am not interested anymore, I went with "
-                      "the other institute. Please don't call me again.\nBD: Understood Anitha, all the best."),
-             "intent": "NOT_INTERESTED", "confidence": 0.98,
-             "summary": "Anitha explicitly declined the course, chose another institute and asked not to be "
-                        "contacted.",
-             "key_points": ["Chose another institute", "Not interested anymore", "Asked not to be called"]},
-        ],
-    },
-    {
-        "lead_id": "L013", "name": "Meena K", "phone": "+919841334455",
-        "email": "meena.k@example.com", "course": ANALYTICS, "bd": "BD005",
-        "created": when(days=-7), "expect": "DROPPED",
-        "calls": [{
-            "caller": "BD005", "ended": when(days=-1), "duration": 154, "target": None,
-            "text": ("Lead: I am not interested in the Data Analytics course. My company is sponsoring an "
-                     "internal program instead, so I don't want the course.\nBD: Thank you for letting me know."),
-            "intent": "NOT_INTERESTED", "confidence": 0.96,
-            "summary": "Meena is not interested; her employer is sponsoring an internal program instead.",
-            "key_points": ["Not interested", "Employer sponsoring an internal program"],
-        }],
-    },
-    # ---------------- NEW lead, no calls yet -- the demo target for "Analyze New Call" ----------------
-    {
-        "lead_id": "L015", "name": "Sandhya Rajan", "phone": "+919841556677",
-        "email": "sandhya.rajan@example.com", "course": AI_ML, "bd": "BD003",
-        "created": when(hours=-3), "expect": "NEW", "calls": [],
-    },
+def build_callers() -> list[dict]:
+    """The BDA directory, in the LeadSquared user shape.
+
+    Only id/name/email have a CRM source; role, team, manager and phone are
+    local metadata because `salesOwner*` is null on every real lead.
+    """
+    docs = []
+    managers = ["Saravana", "Rizwan Quadir", "Vignesh VR"]
+    for index, name in enumerate(V.CALLER_NAMES):
+        first, last = Caller.split_name(name)
+        docs.append({
+            "caller_id": superleap_id(),
+            "name": name,
+            # Deliberately the same mailbox for every seeded BDA -- see
+            # SEED_CALLER_EMAIL in seed_data.py. A reminder digest goes to the
+            # BD's own address, and the CRM's real owners are live mailboxes.
+            "email": V.SEED_CALLER_EMAIL,
+            "first_name": first,
+            "last_name": last,
+            "phone": f"+9196000{11000 + index}",
+            "role": V.ROLES[index % len(V.ROLES)],
+            "user_type": "User",
+            "team": V.TEAMS[index % len(V.TEAMS)],
+            "manager_name": managers[index % len(managers)],
+            "status_code": "Active",
+            # Two inactive BDs: their leads must still be visible and the
+            # dropdown must still list them, marked.
+            "active": index not in (10, 11),
+            "created_at": when(days=-(120 + index * 5)),
+        })
+    return docs
+
+
+# --------------------------------------------------------------------------
+# Leads
+# --------------------------------------------------------------------------
+
+# What each call-active lead is built to demonstrate. The stage, the transcript
+# closer and the analysis outcome are all derived from this, so they agree.
+#   (bucket, count)
+ACTIVE_PLAN = [
+    ("OVERDUE", 5),
+    ("DUE", 3),
+    ("UPCOMING", 4),
+    ("UNSCHEDULED", 3),
+    ("CONVERTED", 3),
+    ("DROPPED", 3),
+    ("NO_ANALYSIS", 7),   # connected with a recording but no transcript yet
+    ("NOT_ANALYZABLE", 12),  # not connected / zero duration
 ]
 
+# Follow-up closers per bucket, and the offset each implies.
+BUCKET_CLOSERS = {
+    "OVERDUE": ["tomorrow_11", "tomorrow_10", "evening_8", "tomorrow_12", "next_week"],
+    "DUE": ["tomorrow_11", "evening_8", "tomorrow_12"],
+    "UPCOMING": ["tomorrow_11", "tomorrow_12", "tomorrow_10", "next_week"],
+    "UNSCHEDULED": ["no_date", "no_date_ta", "no_date"],
+    "CONVERTED": ["converted"] * 3,
+    "DROPPED": ["dropped", "dropped_ta", "dropped"],
+}
 
-def outcome_for(call: dict) -> Outcome:
-    intent = call["intent"]
-    if intent == "NOT_INTERESTED":
-        return Outcome.DROPPED
-    if intent == "READY_TO_ENROLL" and call["target"] is None:
-        return Outcome.CONVERTED
-    return Outcome.FOLLOW_UP_REQUIRED
+
+def stage_for(bucket: str) -> str:
+    if bucket == "CONVERTED":
+        return rng.choice(V.STAGES_CONVERTED)
+    if bucket == "DROPPED":
+        return rng.choice(V.STAGES_DROPPED)
+    if bucket in ("NOT_ANALYZABLE", "NO_ANALYSIS"):
+        return rng.choice(V.STAGES_CONTACTED)
+    return rng.choice(V.STAGES_FOLLOW_UP)
 
 
-def build_analysis_result(call: dict) -> CallAnalysisResult:
-    """Pre-baked analysis, validated through the same gate as live LLM output."""
-    outcome = outcome_for(call)
-    payload = {
-        "outcome": outcome.value,
-        "follow_up_required": outcome is Outcome.FOLLOW_UP_REQUIRED,
-        "follow_up": None,
-        "customer_intent": call["intent"],
-        "summary": call["summary"],
-        "key_points": call["key_points"],
-        "confidence": call["confidence"],
+def follow_up_target(bucket: str) -> datetime | None:
+    """The datetime our analysis extracts, positioned to land in `bucket`."""
+    if bucket == "OVERDUE":
+        return when(hours=-rng.choice([3, 8, 26, 50, 100]))
+    if bucket == "DUE":
+        return when(minutes=rng.choice([25, 55, 95]))
+    if bucket == "UPCOMING":
+        return when(days=rng.choice([1, 2, 3, 6]), hours=rng.choice([1, 3, 5]))
+    return None
+
+
+def build_lead(bucket: str | None, caller: dict, call_active: bool) -> dict:
+    """One lead with every CRM field populated the way the CRM populates it."""
+    stage = stage_for(bucket) if call_active else rng.choice(V.STAGES_NEW + V.STAGES_CONTACTED[:3])
+    created = when(days=-rng.randint(20, 400), hours=-rng.randint(0, 23))
+
+    lead = {
+        "lead_id": superleap_id(),
+        # ~4% of real leads have no externalId.
+        "external_id": guid() if rng.random() > 0.04 else None,
+        "stage": stage,
+        "previous_stage": "New" if call_active and rng.random() < 0.78 else None,
+        "product": weighted(V.PRODUCTS),
+        "language": weighted(V.LANGUAGES) if call_active else None,
+        "win_probability": None,
+        "segmentation": weighted(V.SEGMENTATIONS),
+        # Null on every real lead. Kept in the schema, never invented.
+        "sales_qualified": None,
+        "city": weighted(V.CITIES),
+        "state": weighted(V.STATES),
+        "country": "India" if rng.random() < 0.38 else None,
+        "lead_source": weighted(V.LEAD_SOURCES),
+        "source_campaign": weighted(V.SOURCE_CAMPAIGNS),
+        "source_medium": weighted(V.SOURCE_MEDIUMS),
+        "source_content": weighted(V.SOURCE_CONTENTS),
+        "last_source": None,
+        "last_medium": None,
+        "nurturing": rng.choice(V.NURTURING_URLS) if rng.random() < 0.012 else None,
+        "last_disposition_status": None,
+        "last_sub_disposition_status": None,
+        "last_call_attempted_at": None,
+        "calls_connected": 0,
+        "calls_missed": 0,
+        "total_attempts": 0,
+        "total_talktime_sec": 0,
+        "first_contact_date": None,
+        # 100% null upstream -- conversion is derived from stage, never this.
+        "conversion_date": None,
+        "created_at": created,
+        "updated_at": created,
+        "owner_id": caller["caller_id"],
+        "owner_name": caller["name"],
+        "owner_email": caller["email"],
+        # 100% null upstream: there is no sales-owner data in the CRM at all.
+        "sales_owner_id": None,
+        "sales_owner_name": None,
+        # Ours.
+        "lead_status": map_stage(stage).value,
+        "follow_up": dict(followup_service.NO_FOLLOW_UP),
+        "follow_up_history": [],
+        "last_call_at": None,
+        "latest_call_id": None,
+        "latest_outcome": None,
+        "latest_sentiment": None,
+        "latest_analysis_id": None,
     }
-    if outcome is Outcome.FOLLOW_UP_REQUIRED:
-        target = call["target"]
-        payload["follow_up"] = {
-            "datetime": target.astimezone(IST).isoformat() if target else None,
-            "reason": call.get("reason"),
+
+    if call_active:
+        # Call-active leads carry the fields that are ~92% null globally but
+        # populated on every lead that has actually been called.
+        lead["first_contact_date"] = created + timedelta(days=rng.randint(1, 10))
+        lead["win_probability"] = float(rng.choice([5, 10, 15, 25, 45, 55, 65, 70, 72]))
+        lead["last_disposition_status"] = (
+            "Connected" if bucket != "NOT_ANALYZABLE" else "Not Connected"
+        )
+        lead["last_sub_disposition_status"] = stage
+    return lead
+
+
+# --------------------------------------------------------------------------
+# Transcripts
+# --------------------------------------------------------------------------
+
+def build_transcript_text(closer_key: str, tamil: bool) -> str:
+    """A transcript in the CRM's real format: [MM:SS] Agent:/Customer: lines."""
+    opener = rng.choice(V.OPENERS_TA if tamil else V.OPENERS_EN)
+    middle = rng.choice(V.MIDDLES_TA if tamil else V.MIDDLES_EN)
+    closer = V.CLOSERS[closer_key]
+
+    lines: list[tuple[str, str]] = [*opener, *middle, *closer]
+    out: list[str] = []
+    seconds = 0
+    for speaker, text in lines:
+        out.append(f"[{seconds // 60:02d}:{seconds % 60:02d}] {speaker}: {text}")
+        seconds += rng.randint(3, 14)
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# analysisSummary (the CRM's own analysis)
+# --------------------------------------------------------------------------
+
+def build_analysis_summary(lead: dict, closer_key: str, pitch: int) -> tuple[str, int]:
+    """The CRM's analysis JSON, with all ten autofill questions present.
+
+    Returns (json_string, violation_count). The follow-up answer is prose and
+    never carries a timestamp -- extracting one is our job, not the CRM's.
+    """
+    status = rng.choice(V.PROSPECT_STATUSES)
+    product = lead.get("product") or "the programme"
+    next_step = (
+        "Customer agreed to review the details and confirm."
+        if closer_key.startswith("no_date")
+        else "A specific follow-up was agreed at the end of the call."
+    )
+    summary = rng.choice(V.SUMMARY_TEMPLATES).format(
+        status=status.lower(), product=product, next_step=next_step
+    )
+
+    violation_count = rng.choice([0, 0, 0, 0, 1, 1, 2, 2, 3, 4])
+    violations = [
+        {"severity": sev, "issue": issue, "detail": detail}
+        for sev, issue, detail in rng.sample(V.VIOLATIONS, violation_count)
+    ] if violation_count else []
+
+    answers = [
+        lead.get("city") or "n/a",
+        rng.choice(["yes", "no"]),
+        rng.choice(V.PAYMENT_OPTIONS),
+        rng.choice(["yes", "no"]),
+        product,
+        status,
+        "yes" if closer_key == "converted" else "no",
+        lead.get("language") or "n/a",
+        rng.choice(V.QUALIFICATIONS),
+        V.FOLLOW_UP_PROSE[closer_key],
+    ]
+
+    payload = {
+        "call_summary": summary,
+        "performance_metrics": {
+            "pitch_score_percent": pitch,
+            "win_probability": int(lead.get("win_probability") or 50),
+        },
+        "findings": {
+            "autofill_data": [
+                {"question": q, "answer": a}
+                for q, a in zip(V.AUTOFILL_QUESTIONS, answers)
+            ],
+            "violations": violations,
+            "improvement_tips": rng.sample(V.IMPROVEMENT_TIPS, rng.randint(2, 4)),
+        },
+    }
+    return json.dumps(payload), violation_count
+
+
+# --------------------------------------------------------------------------
+# Analyses
+# --------------------------------------------------------------------------
+
+INTENT_BY_BUCKET = {
+    "OVERDUE": "INTERESTED", "DUE": "INTERESTED", "UPCOMING": "NEEDS_TIME",
+    "UNSCHEDULED": "NEEDS_TIME", "CONVERTED": "READY_TO_ENROLL", "DROPPED": "NOT_INTERESTED",
+}
+OUTCOME_BY_BUCKET = {
+    "OVERDUE": Outcome.FOLLOW_UP_REQUIRED, "DUE": Outcome.FOLLOW_UP_REQUIRED,
+    "UPCOMING": Outcome.FOLLOW_UP_REQUIRED, "UNSCHEDULED": Outcome.FOLLOW_UP_REQUIRED,
+    "CONVERTED": Outcome.CONVERTED, "DROPPED": Outcome.DROPPED,
+}
+
+
+# Sentiment per scripted bucket, as (label, trajectory, score-range) weighted
+# choices. Chosen so the seeded worklist exercises the ordering rule visibly:
+# OVERDUE deliberately spans the whole range, including a DECLINED lead that
+# must sort above older but happier ones.
+SENTIMENT_BY_BUCKET = {
+    "OVERDUE": [
+        ("NEGATIVE", "DECLINED", (-0.8, -0.4)),
+        ("NEUTRAL", "DECLINED", (-0.3, 0.0)),
+        ("NEGATIVE", "STABLE", (-0.7, -0.3)),
+        ("MIXED", "STABLE", (-0.2, 0.2)),
+        ("POSITIVE", "IMPROVED", (0.3, 0.7)),
+    ],
+    "DUE": [
+        ("MIXED", "STABLE", (-0.2, 0.3)),
+        ("POSITIVE", "IMPROVED", (0.4, 0.8)),
+        ("NEUTRAL", "STABLE", (-0.1, 0.2)),
+    ],
+    "UPCOMING": [
+        ("POSITIVE", "IMPROVED", (0.4, 0.8)),
+        ("NEUTRAL", "STABLE", (-0.1, 0.2)),
+        # One un-judgeable call, so the "not assessed" path is rendered too.
+        ("UNKNOWN", "UNKNOWN", None),
+        ("MIXED", "DECLINED", (-0.3, 0.1)),
+    ],
+    "UNSCHEDULED": [
+        ("NEUTRAL", "STABLE", (-0.2, 0.1)),
+        ("MIXED", "STABLE", (-0.3, 0.2)),
+        ("UNKNOWN", "UNKNOWN", None),
+    ],
+    "CONVERTED": [("POSITIVE", "IMPROVED", (0.6, 0.95))],
+    "DROPPED": [("NEGATIVE", "DECLINED", (-0.95, -0.55))],
+}
+
+# Verbatim lines lifted from the transcript closers in seed_data, so the
+# evidence quote is genuinely something the customer said on that call.
+SENTIMENT_EVIDENCE = {
+    "POSITIVE": ["Okay, set up a Google Meet tomorrow at 11 AM.",
+                 "I have made the payment just now, please confirm."],
+    "NEUTRAL": ["Send everything on WhatsApp, I will review and get back.",
+                "WhatsApp-la anuppunga, naan paathutu sollren."],
+    "MIXED": ["Okay, my English is not good, that's why I-",
+              "fees evlo aagum-nu mattum sollunga."],
+    "NEGATIVE": ["ippo vendaam, naan paarkala.",
+                 "enakku interest illa, naan vera place-la join panniten.",
+                 "I am not interested, I already joined somewhere else."],
+    "UNKNOWN": [None],
+}
+
+
+# Cycled, not randomly picked. With only 3-5 leads per bucket, random choice
+# regularly produces five negative OVERDUE leads and the sentiment ordering
+# becomes invisible -- both to a reader and to any test asserting it. Cycling
+# guarantees each bucket shows its full declared spread every reseed.
+_sentiment_cursor: dict[str, int] = {}
+
+
+def build_sentiment(bucket: str) -> dict:
+    """A sentiment block consistent with the bucket's scripted outcome."""
+    options = SENTIMENT_BY_BUCKET[bucket]
+    index = _sentiment_cursor.get(bucket, 0)
+    _sentiment_cursor[bucket] = index + 1
+    label, trajectory, score_range = options[index % len(options)]
+    return {
+        "label": label,
+        "score": round(rng.uniform(*score_range), 2) if score_range else None,
+        "trajectory": trajectory,
+        "evidence": rng.choice(SENTIMENT_EVIDENCE[label]),
+    }
+
+
+def build_analysis_result(bucket: str, target: datetime | None, lead: dict) -> CallAnalysisResult:
+    """The validated analysis, as the pipeline would have produced it."""
+    outcome = OUTCOME_BY_BUCKET[bucket]
+    product = lead.get("product") or "the programme"
+
+    if outcome is Outcome.CONVERTED:
+        payload = {
+            "outcome": outcome.value, "follow_up_required": False, "follow_up": None,
+            "customer_intent": "READY_TO_ENROLL",
+            "summary": f"The lead confirmed payment for {product} and is enrolled.",
+            "key_points": ["Payment confirmed on the call", "Batch start communicated"],
+            "confidence": round(rng.uniform(0.88, 0.97), 2),
+            "sentiment": build_sentiment(bucket),
+        }
+    elif outcome is Outcome.DROPPED:
+        payload = {
+            "outcome": outcome.value, "follow_up_required": False, "follow_up": None,
+            "customer_intent": "NOT_INTERESTED",
+            "summary": f"The lead declined {product} and asked not to be contacted further.",
+            "key_points": ["Explicitly not interested", "Chose another provider"],
+            "confidence": round(rng.uniform(0.85, 0.96), 2),
+            "sentiment": build_sentiment(bucket),
+        }
+    else:
+        local = target.astimezone(IST) if target else None
+        payload = {
+            "outcome": outcome.value,
+            "follow_up_required": True,
+            "follow_up": {
+                "date": local.strftime("%Y-%m-%d") if local else None,
+                "time": local.strftime("%H:%M") if local else None,
+                "datetime": local.isoformat() if local else None,
+                "reason": (
+                    f"The lead asked for a call back about {product}."
+                    if local else NO_DATE_REASON
+                ),
+            },
+            "customer_intent": INTENT_BY_BUCKET[bucket],
+            "summary": (
+                f"The lead is considering {product} and asked for details before deciding."
+            ),
+            "key_points": ["Details to be shared on WhatsApp", "Fees and EMI discussed"],
+            "confidence": round(rng.uniform(0.72, 0.94), 2),
+            "sentiment": build_sentiment(bucket),
         }
     return CallAnalysisResult.model_validate(payload)
 
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 
 def main() -> None:
     ping()
     db = get_db()
 
-    for name in (LEADS, CALLERS, CALLS, CALL_TRANSCRIPTS, CALL_ANALYSES, "call_outcomes"):
+    # followup_alerts is dropped too: stale delivery rows would make the
+    # once-a-day dedupe skip the first send after a reseed.
+    for name in (LEADS, CALLERS, CALLS, CALL_TRANSCRIPTS, CALL_ANALYSES,
+                 FOLLOWUP_ALERTS, "call_outcomes"):
         db.drop_collection(name)
     ensure_indexes()
 
-    # ---- Callers ----
-    db[CALLERS].insert_many(
-        [{**c, "active": True, "created_at": when(days=-60)} for c in CALLERS_SPEC]
-    )
+    callers = build_callers()
+    db[CALLERS].insert_many([dict(c) for c in callers])
 
-    call_counter = 0
+    recording_ids = load_recording_ids()
+    rec_index = 0
+
     leads_docs: list[dict] = []
     calls_docs: list[dict] = []
     transcripts_docs: list[dict] = []
     analyses_docs: list[dict] = []
 
-    for spec in LEADS_SPEC:
-        lead = {
-            "lead_id": spec["lead_id"],
-            "name": spec["name"],
-            "phone": spec["phone"],
-            "email": spec["email"],
-            "course": spec["course"],
-            "assigned_bd": BD[spec["bd"]],
-            "lead_status": LeadStatus.NEW.value,
-            "follow_up": dict(followup_service.NO_FOLLOW_UP),
-            "follow_up_history": [],
-            "last_call_at": None,
-            "latest_call_id": None,
-            "latest_outcome": None,
-            "latest_analysis_id": None,
-            "created_at": spec["created"],
-            "updated_at": spec["created"],
-        }
-        leads_docs.append(lead)
+    # ---- Call-active leads ------------------------------------------------
+    for bucket, count in ACTIVE_PLAN:
+        for _ in range(count):
+            caller = rng.choice(callers)
+            lead = build_lead(bucket, caller, call_active=True)
 
-        for call in spec["calls"]:
-            call_counter += 1
-            call_id = f"CALL-{call_counter:03d}"
-            transcript_id = f"TR-{call_counter:03d}"
-            analysis_id = f"AN-{call_counter:03d}"
-            ended = call["ended"]
-            text = call["text"].replace("{when}", spoken(call["target"])) if call["target"] else call["text"]
+            analyzable = bucket not in ("NOT_ANALYZABLE",)
+            has_transcript = bucket not in ("NOT_ANALYZABLE", "NO_ANALYSIS")
+            has_recording = analyzable
 
-            result = build_analysis_result(call)
+            # The call itself.
+            attempts = rng.randint(1, 4)
+            duration = 0 if not analyzable else rng.choice([48, 77, 96, 145, 215, 402, 600])
+            ended = when(days=-rng.randint(0, 6), hours=-rng.randint(1, 20))
+            started = ended - timedelta(seconds=duration)
+            # Call owner is often NOT the lead owner -- true in the real data,
+            # and the reason the directory is built from both sources.
+            call_owner = rng.choice(callers) if rng.random() < 0.35 else caller
+            direction = "inbound" if rng.random() < 0.13 else "outbound"
 
-            calls_docs.append({
+            if analyzable:
+                telephony, final = "connected", "completed"
+            elif rng.random() < 0.1:
+                telephony, final = "missed_call", "agent_unanswered"
+            else:
+                telephony, final = "not_connected", "customer_canceled"
+
+            call_id = f"CALL-{superleap_id()[7:]}"
+            crm_call_id = None
+            if has_recording and rec_index < len(recording_ids):
+                crm_call_id = recording_ids[rec_index]
+                rec_index += 1
+
+            closer_key = rng.choice(BUCKET_CLOSERS[bucket]) if bucket in BUCKET_CLOSERS else "no_date"
+            tamil = (lead.get("language") in {"Tamil", "Malayalam"}) or closer_key.endswith("_ta")
+
+            # The CRM analysed ~37% of calls; pitch/violations come with it.
+            pitch = None
+            analysis_summary = None
+            violations = 0
+            if analyzable and rng.random() < 0.55:
+                pitch = rng.choice([15, 18, 19, 28, 29, 34, 43, 44, 49, 51, 62, 66, 67, 70])
+                analysis_summary, violations = build_analysis_summary(lead, closer_key, pitch)
+
+            call = {
                 "call_id": call_id,
-                "lead_id": spec["lead_id"],
-                "caller_id": call["caller"],
-                "source_type": "UPLOAD",
-                "audio_url": None,
-                "audio_file_path": None,      # seeded calls have no recording on disk
-                "audio_mime": None,
-                "audio_bytes": None,
-                "audio_filename": None,
-                "duration_seconds": call["duration"],
-                "status": CallStatus.COMPLETED.value,
+                "lead_id": lead["lead_id"],
+                "caller_id": call_owner["caller_id"],
+                "crm_call_id": crm_call_id,
+                "call_time": started,
+                "start_time": started,
+                "end_time": ended,
+                "direction": direction,
+                "duration_sec": duration,
+                "telephony_status": telephony,
+                "final_status": final,
+                "pitch_score": float(pitch) if pitch is not None else None,
+                "violations": violations,
+                "analysis_summary": analysis_summary,
+                "analysis_summary_parsed": json.loads(analysis_summary) if analysis_summary else None,
+                "has_recording": has_recording,
+                "has_transcript": has_transcript,
+                "recording_path": f"/recording/{crm_call_id}" if crm_call_id else None,
+                "transcript_path": f"/transcript/{crm_call_id}" if (has_transcript and crm_call_id) else None,
+                "owner_id": call_owner["caller_id"],
+                "owner_name": call_owner["name"],
+                "owner_email": call_owner["email"],
+                "status": CallStatus.PENDING.value,
                 "error": None,
-                "transcript_id": transcript_id,
-                "analysis_id": analysis_id,
-                "started_at": ended - timedelta(seconds=call["duration"]),
-                "ended_at": ended,
+                "failed_stage": None,
+                "transcript_id": None,
+                "analysis_id": None,
                 "created_at": ended,
-                "processed_at": ended + timedelta(minutes=1),
+                "processed_at": None,
                 "seeded": True,
-            })
-            transcripts_docs.append({
-                "transcript_id": transcript_id,
-                "call_id": call_id,
-                "lead_id": spec["lead_id"],
-                "caller_id": call["caller"],
-                "transcript": text,
-                "language": "en-IN",
-                "duration_seconds": call["duration"],
-                "provider": SEED_MODEL,
-                "created_at": ended + timedelta(seconds=30),
-            })
-            analyses_docs.append({
-                "analysis_id": analysis_id,
-                "call_id": call_id,
-                "lead_id": spec["lead_id"],
-                "caller_id": call["caller"],
-                "model": SEED_MODEL,
-                "status": "COMPLETED",
-                "outcome": result.outcome.value,
-                "follow_up_required": result.follow_up_required,
-                "follow_up": result.follow_up.model_dump() if result.follow_up else None,
-                "customer_intent": result.customer_intent.value,
-                "summary": result.summary,
-                "key_points": result.key_points,
-                "confidence": result.confidence,
-                "raw_response": None,
-                "error": None,
-                "degraded": False,
-                "created_at": ended + timedelta(minutes=1),
-            })
+            }
 
-            # Project the analysis onto the lead exactly as the pipeline does,
-            # in call order, so the LAST call wins.
-            lead["lead_status"] = followup_service.OUTCOME_TO_LEAD_STATUS[result.outcome].value
-            lead["follow_up"] = followup_service.follow_up_block_from_analysis(result)
+            # Lead call-activity counters, consistent with the call.
+            lead["total_attempts"] = attempts
+            lead["calls_connected"] = 1 if telephony == "connected" else 0
+            lead["calls_missed"] = 1 if telephony != "connected" else 0
+            lead["total_talktime_sec"] = duration
+            lead["last_call_attempted_at"] = ended
             lead["last_call_at"] = ended
             lead["latest_call_id"] = call_id
-            lead["latest_outcome"] = result.outcome.value
-            lead["latest_analysis_id"] = analysis_id
-            lead["updated_at"] = ended + timedelta(minutes=1)
+            lead["updated_at"] = ended
+
+            if not analyzable:
+                call["status"] = CallStatus.NOT_ANALYZABLE.value
+                call["error"] = "This call has neither a transcript nor a recording."
+
+            # ---- Transcript ----
+            if has_transcript:
+                transcript = {
+                    "transcript_id": f"TR-{superleap_id()[7:]}",
+                    "call_id": call_id,
+                    "lead_id": lead["lead_id"],
+                    "caller_id": call_owner["caller_id"],
+                    "transcript": build_transcript_text(closer_key, tamil),
+                    "language": "ta-IN" if tamil else "en-IN",
+                    "duration_seconds": duration,
+                    "provider": SEED_MODEL,
+                    "source": CRM_SOURCE,
+                    "created_at": ended + timedelta(seconds=30),
+                }
+                transcripts_docs.append(transcript)
+                call["transcript_id"] = transcript["transcript_id"]
+
+            # ---- Analysis (only where there is a transcript to justify it) ----
+            if has_transcript and bucket in OUTCOME_BY_BUCKET:
+                target = follow_up_target(bucket)
+                result = build_analysis_result(bucket, target, lead)
+                analysis = {
+                    "analysis_id": f"AN-{superleap_id()[7:]}",
+                    "call_id": call_id,
+                    "lead_id": lead["lead_id"],
+                    "caller_id": call_owner["caller_id"],
+                    "model": SEED_MODEL,
+                    "status": "COMPLETED",
+                    "outcome": result.outcome.value,
+                    "follow_up_required": result.follow_up_required,
+                    "follow_up": result.follow_up.model_dump() if result.follow_up else None,
+                    "customer_intent": result.customer_intent.value,
+                    "summary": result.summary,
+                    "key_points": result.key_points,
+                    "confidence": result.confidence,
+                    "sentiment": result.sentiment.model_dump(mode="json"),
+                    "raw_response": None,
+                    "error": None,
+                    "degraded": False,
+                    "created_at": ended + timedelta(minutes=1),
+                }
+                analyses_docs.append(analysis)
+
+                call["status"] = CallStatus.COMPLETED.value
+                call["analysis_id"] = analysis["analysis_id"]
+                call["processed_at"] = analysis["created_at"]
+
+                # Apply to the lead, exactly as apply_analysis_to_lead would.
+                lead["lead_status"] = followup_service.OUTCOME_TO_LEAD_STATUS[
+                    result.outcome
+                ].value
+                lead["follow_up"] = followup_service.follow_up_block_from_analysis(result)
+                lead["latest_outcome"] = result.outcome.value
+                lead["latest_sentiment"] = result.sentiment.model_dump(mode="json")
+                lead["latest_analysis_id"] = analysis["analysis_id"]
+
+            calls_docs.append(call)
+            leads_docs.append(lead)
+
+    # ---- Never-called leads (95% of production; 24 here) ------------------
+    for _ in range(60 - len(leads_docs)):
+        leads_docs.append(build_lead(None, rng.choice(callers), call_active=False))
 
     db[LEADS].insert_many(leads_docs)
     db[CALLS].insert_many(calls_docs)
-    db[CALL_TRANSCRIPTS].insert_many(transcripts_docs)
-    db[CALL_ANALYSES].insert_many(analyses_docs)
+    if transcripts_docs:
+        db[CALL_TRANSCRIPTS].insert_many(transcripts_docs)
+    if analyses_docs:
+        db[CALL_ANALYSES].insert_many(analyses_docs)
 
-    # ---- Report ----
-    print(f"Seeded at {NOW:%Y-%m-%d %H:%M} UTC\n")
-    print(f"{'Lead':<6} {'Name':<18} {'Course':<24} {'BD':<8} {'Outcome':<19} {'Follow-up (UTC)':<18} Bucket")
-    for spec in LEADS_SPEC:
-        lead = db[LEADS].find_one({"lead_id": spec["lead_id"]})
-        bucket = followup_service.compute_bucket(lead["follow_up"], NOW).value
-        fu = lead["follow_up"]
-        shown = fu["datetime"].strftime("%d %b %H:%M") if fu.get("datetime") else ("(no date)" if fu.get("required") else "-")
-        expected = spec["expect"]
-        actual = bucket if fu.get("required") else (lead["lead_status"] if lead["latest_outcome"] else "NEW")
-        flag = "" if actual == expected else "  <-- unexpected"
-        print(f"{lead['lead_id']:<6} {lead['name']:<18} {lead['course']:<24} {lead['assigned_bd']['name']:<8} "
-              f"{lead['latest_outcome'] or '-':<19} {shown:<18} {actual}{flag}")
+    _report(db, leads_docs, calls_docs, transcripts_docs, analyses_docs, callers, rec_index)
 
-    print(
-        f"\nCollections: leads={db[LEADS].count_documents({})} callers={db[CALLERS].count_documents({})} "
-        f"calls={db[CALLS].count_documents({})} call_transcripts={db[CALL_TRANSCRIPTS].count_documents({})} "
-        f"call_analyses={db[CALL_ANALYSES].count_documents({})}"
+
+def _report(db, leads, calls, transcripts, analyses, callers, rec_used) -> None:
+    now = followup_service.utcnow()
+    buckets: dict[str, int] = {}
+    for lead in leads:
+        bucket = followup_service.compute_bucket(lead.get("follow_up"), now).value
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+
+    print(f"\nSeeded {len(leads)} leads, {len(callers)} callers, {len(calls)} calls, "
+          f"{len(transcripts)} transcripts, {len(analyses)} analyses.")
+    print(f"  recordings linked to real CRM callIds: {rec_used}")
+
+    call_active = [l for l in leads if l["total_attempts"] > 0]
+    print(f"  call-active leads: {len(call_active)}  |  never called: {len(leads) - len(call_active)}")
+    print("  follow-up buckets: " + ", ".join(f"{k}={v}" for k, v in sorted(buckets.items())))
+    print("  call status:       " + ", ".join(
+        f"{s}={sum(1 for c in calls if c['status'] == s)}"
+        for s in sorted({c["status"] for c in calls})))
+    print(f"  has_recording={sum(1 for c in calls if c['has_recording'])}  "
+          f"has_transcript={sum(1 for c in calls if c['has_transcript'])}  "
+          f"analysis_summary={sum(1 for c in calls if c['analysis_summary'])}  "
+          f"inbound={sum(1 for c in calls if c['direction'] == 'inbound')}")
+
+    # Invariants worth asserting rather than eyeballing.
+    assert all("name" not in l and "phone" not in l and "email" not in l for l in leads), \
+        "leads must carry no PII -- the CRM exposes none"
+    assert all(l["conversion_date"] is None for l in leads), "conversion_date is null upstream"
+    assert all(l["sales_qualified"] is None for l in leads), "sales_qualified is null upstream"
+    assert all(l["sales_owner_id"] is None and l["sales_owner_name"] is None for l in leads), \
+        "sales owner is null upstream"
+    assert all(c["has_recording"] for c in calls if c["has_transcript"]), \
+        "transcript implies recording"
+
+    # The reminder digest emails a BD at their own address, and a real SMTP
+    # account is configured. If a real mailbox ever gets seeded, the scheduler
+    # mails an actual colleague. Fail the seed rather than let that ship.
+    addresses = (
+        {c.get("email") for c in callers}
+        | {lead.get("owner_email") for lead in leads}
+        | {call.get("owner_email") for call in calls}
+    ) - {None}
+    stray = sorted(a for a in addresses if a != V.SEED_CALLER_EMAIL)
+    assert not stray, (
+        f"Seeded a mailbox that is not {V.SEED_CALLER_EMAIL}: {stray}. "
+        "Reminder digests would be delivered to it."
     )
-    print("\nL015 Sandhya Rajan has no calls yet -- use her as the target for 'Analyze New Call'.")
-    close_client()
+
+    analysed = [l for l in leads if l.get("latest_analysis_id")]
+    sentiments: dict[str, int] = {}
+    for lead in analysed:
+        label = (lead.get("latest_sentiment") or {}).get("label", "?")
+        sentiments[label] = sentiments.get(label, 0) + 1
+    print("  sentiment:         " + ", ".join(f"{k}={v}" for k, v in sorted(sentiments.items())))
+
+    assert all(l.get("latest_sentiment") for l in analysed), \
+        "every analysed lead must carry a denormalized sentiment"
+    assert all(
+        (l["latest_sentiment"].get("score") is None)
+        for l in analysed
+        if l["latest_sentiment"]["label"] == "UNKNOWN"
+    ), "UNKNOWN sentiment must never carry a score"
+
+    print("  invariants: no PII, conversion/sales-owner null, transcript implies recording,")
+    print(f"              every address is {V.SEED_CALLER_EMAIL}  OK")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        close_client()

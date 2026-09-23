@@ -47,39 +47,48 @@ export const api = {
   getFilterOptions: () => get('/api/dashboard/filters'),
   getFollowUps: (filters = {}) => get('/api/leads/follow-ups', cleanParams(filters)),
   getClosed: (filters = {}) => get('/api/leads/closed', cleanParams(filters)),
-  getLeads: (filters = {}) => get('/api/leads', cleanParams(filters)),
   getLead: (leadId) => get(`/api/leads/${leadId}`),
-  getCallers: () => get('/api/callers'),
+  /**
+   * `includeInactive` defaults true: an inactive BD can still own pending
+   * follow-ups, and excluding them makes those queues unreachable from the
+   * selector. The combobox marks them instead of hiding them.
+   */
+  getCallers: (includeInactive = true) =>
+    get('/api/callers', cleanParams({ include_inactive: includeInactive || undefined })),
 
-  // ---- call ingestion ----
-  uploadCall({ file, leadId, callerId }, onProgress) {
-    const form = new FormData()
-    form.append('file', file)
-    form.append('lead_id', leadId)
-    form.append('caller_id', callerId)
-    return request(
-      longClient.post('/api/calls/upload', form, {
-        onUploadProgress: (e) => {
-          if (onProgress && e.total) onProgress(Math.round((e.loaded / e.total) * 100))
-        },
-      }),
-    )
-  },
-  validateAudioUrl: (audioUrl) => request(client.post('/api/calls/validate-url', { audio_url: audioUrl })),
-  createCallFromUrl: ({ audioUrl, leadId, callerId }) =>
-    request(client.post('/api/calls/from-url', { audio_url: audioUrl, lead_id: leadId, caller_id: callerId })),
-  createCallFromText: ({ transcript, leadId, callerId }) =>
-    request(client.post('/api/calls/from-text', { transcript, lead_id: leadId, caller_id: callerId })),
-
-  // ---- processing ----
-  processCall: (callId) => request(longClient.post(`/api/calls/${callId}/process`)),
-  getCallStatus: (callId) => get(`/api/calls/${callId}/status`),
-  getCallAnalyses: (callId) => get(`/api/calls/${callId}/analyses`),
-  /** URL the <audio> element streams from. The backend resolves the file by call id. */
+  // ---- calls ----
+  getCalls: (leadId) => get('/api/calls', cleanParams({ lead_id: leadId })),
+  getCallTranscript: (callId) => get(`/api/calls/${callId}/transcript`),
+  /**
+   * Analyse one existing call. Long client: this runs transcription and the
+   * analysis model synchronously and can take minutes on a long recording.
+   */
+  analyzeCall: (callId) => request(longClient.post(`/api/calls/${callId}/analyze`)),
+  /** URL the <audio> element streams from. The backend proxies it from the CRM. */
   audioUrlFor: (callId) => `${baseURL}/api/calls/${callId}/audio`,
 
   // ---- follow-up actions ----
   updateFollowUp: (leadId, payload) => request(client.patch(`/api/leads/${leadId}/follow-up`, payload)),
+
+  // ---- reminders ----
+  /** `bd` is a caller_id, not a name -- reminders address a mailbox. */
+  getPendingAlerts: (bd) => get('/api/alerts/pending', cleanParams({ bd })),
+  getAlertHistory: (bd, limit = 20) => get('/api/alerts/history', cleanParams({ bd, limit })),
+  /** Sending to every BD makes one blocking SMTP call per BD, so this uses the long client. */
+  sendDigest: (bdId) => request(longClient.post('/api/alerts/send', bdId ? { bd_id: bdId } : {})),
+  /**
+   * Remind the owner about ONE lead, now. Works for a follow-up that is merely
+   * upcoming or has no date -- neither of which the daily digest includes.
+   * 409 when there is genuinely nothing to remind about.
+   */
+  sendLeadReminder: (leadId) => request(longClient.post('/api/alerts/send', { lead_id: leadId })),
+  /** The one-lead reminder HTML, without sending it. Needs no SMTP. */
+  leadReminderPreviewUrl: (leadId) =>
+    `${baseURL}/api/alerts/preview?lead=${encodeURIComponent(leadId)}`,
+
+  // ---- insights ----
+  getInsightsOverview: (filters = {}) => get('/api/insights/overview', cleanParams(filters)),
+  getInsightsByBD: (filters = {}) => get('/api/insights/by-bd', cleanParams(filters)),
 }
 
 export default api

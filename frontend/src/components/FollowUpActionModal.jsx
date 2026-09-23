@@ -1,8 +1,11 @@
 import { useState } from 'react'
 
+// Rescheduling is the only follow-up action left. Marking done and cancelling
+// are both retired: a BD closing a follow-up by hand clears the queue without
+// anything having happened, so closure belongs to the call analysis. The
+// backend refuses both -- their enum values survive only so leads acted on
+// before the change still deserialise.
 const TITLES = {
-  COMPLETE: 'Mark Follow-up Done',
-  CANCEL: 'Cancel Follow-up',
   RESCHEDULE: 'Reschedule Follow-up',
 }
 
@@ -54,7 +57,7 @@ export default function FollowUpActionModal({ lead, action, onClose, onSubmit })
           <div className="modal-head">
             <div>
               <h2>{TITLES[action]}</h2>
-              <div className="sub">{lead.name} · {lead.lead_id}</div>
+              <div className="sub"><span className="mono">{lead.lead_id}</span>{lead.product ? ` · ${lead.product}` : ''}</div>
             </div>
             <button type="button" className="close-x" onClick={onClose} aria-label="Close">×</button>
           </div>
@@ -81,9 +84,7 @@ export default function FollowUpActionModal({ lead, action, onClose, onSubmit })
                 value={reason}
                 onChange={(e) => setReason(e.target.value)}
                 placeholder={
-                  action === 'COMPLETE' ? 'e.g. Spoke to the lead, demo session booked.'
-                    : action === 'CANCEL' ? 'e.g. Duplicate lead, handled under L006.'
-                      : 'e.g. Lead was travelling, agreed a new slot.'
+                  'e.g. Lead was travelling, agreed a new slot.'
                 }
               />
             </div>

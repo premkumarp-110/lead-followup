@@ -31,10 +31,8 @@ services:
     environment:
       MONGODB_URL: mongodb://mongo:27017
       DATABASE_NAME: lead_followup_db
-      CALL_ANALYZER_ENABLED: ${CALL_ANALYZER_ENABLED:-true}
-      CALL_ANALYZER_UPLOAD_ENABLED: ${CALL_ANALYZER_UPLOAD_ENABLED:-true}
-      CALL_ANALYZER_URL_ENABLED: ${CALL_ANALYZER_URL_ENABLED:-true}
-      CALL_ANALYZER_TEXT_ENABLED: ${CALL_ANALYZER_TEXT_ENABLED:-true}
+      LEAD_CALL_API_URL: ${LEAD_CALL_API_URL:-https://lead-call-api.codingpuppet.com}
+      LEAD_CALL_API_KEY: ${LEAD_CALL_API_KEY:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT}
       GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-us-central1}
       VERTEX_AI_MODEL: ${VERTEX_AI_MODEL:-gemini-2.5-flash}
@@ -45,10 +43,8 @@ services:
       CALL_ANALYSIS_MODEL: ${CALL_ANALYSIS_MODEL:-global.anthropic.claude-sonnet-5}
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-vertex}
       ANALYSIS_FALLBACK_ENABLED: ${ANALYSIS_FALLBACK_ENABLED:-true}
-      AUDIO_STORAGE_MODE: ${AUDIO_STORAGE_MODE:-local}
       AUDIO_PLAYBACK_ENABLED: ${AUDIO_PLAYBACK_ENABLED:-true}
-      AUDIO_UPLOAD_DIR: /data/uploads
-      MAX_AUDIO_MB: ${MAX_AUDIO_MB:-20}
+      AUDIO_CACHE_DIR: /data/uploads
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     volumes:
       - uploads:/data/uploads

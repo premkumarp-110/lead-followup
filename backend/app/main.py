@@ -11,7 +11,7 @@ from pymongo.errors import PyMongoError
 from app.config import settings
 from app.database import close_client, ensure_indexes, ping
 from app.models.schemas import UIConfig
-from app.routes import callers, calls, dashboard, leads
+from app.routes import alerts, callers, calls, dashboard, insights, leads
 from app.scheduler import start_scheduler, stop_scheduler
 from app.services.audio_service import AudioValidationError
 from app.services.transcription_service import TranscriptionError
@@ -28,18 +28,25 @@ async def lifespan(app: FastAPI):
     ensure_indexes()
     settings.upload_path.mkdir(parents=True, exist_ok=True)
     vertex_error = settings.vertex_config_error()
+    crm_error = settings.lead_call_config_error()
     logger.info(
-        "Connected to MongoDB database '%s'. Transcription: %s. Analysis model: %s. Audio: %s "
-        "(playback %s).",
+        "Connected to MongoDB database '%s'. Transcription: %s. Analysis model: %s. "
+        "Audio playback: %s.",
         settings.database_name,
         settings.transcription_provider,
         settings.call_analysis_model,
-        settings.audio_storage_mode,
         "on" if settings.audio_playback_enabled else "off",
     )
     if vertex_error:
         logger.warning(
-            "Vertex AI is NOT configured -- audio analysis will fail until fixed: %s", vertex_error
+            "Vertex AI is NOT configured -- audio transcription will fail until fixed: %s",
+            vertex_error,
+        )
+    if crm_error:
+        # Only recording playback depends on this. Everything else -- the
+        # dashboard, worklist, insights, every seeded record -- works without it.
+        logger.warning(
+            "The Lead Call API is NOT configured -- call recordings will not play: %s", crm_error
         )
 
     scheduler = start_scheduler()
@@ -74,6 +81,8 @@ app.include_router(leads.router)
 app.include_router(calls.router)
 app.include_router(callers.router)
 app.include_router(dashboard.router)
+app.include_router(alerts.router)
+app.include_router(insights.router)
 
 
 # --------------------------------------------------------------------------
@@ -142,18 +151,17 @@ def health() -> dict:
 def ui_config() -> dict:
     """Non-secret settings for the frontend. No credentials, ever."""
     return {
-        "call_analyzer_enabled": settings.call_analyzer_enabled,
-        "call_analyzer_upload_enabled": settings.call_analyzer_upload_enabled,
-        "call_analyzer_url_enabled": settings.call_analyzer_url_enabled,
-        "call_analyzer_text_enabled": settings.call_analyzer_text_enabled,
-        "audio_storage_mode": settings.audio_storage_mode,
         "audio_playback_enabled": settings.audio_playback_enabled,
-        "max_audio_mb": settings.max_audio_mb,
-        "allowed_audio_types": settings.allowed_audio_extensions,
+        # Whether a CRM key exists at all -- never the key itself.
+        "recording_source_configured": settings.lead_call_config_error() is None,
         "transcription_provider": settings.transcription_provider,
         "analysis_model": settings.call_analysis_model,
         "vertex_configured": settings.vertex_config_error() is None,
         "analysis_fallback_enabled": settings.analysis_fallback_enabled,
+        "followup_alerts_enabled": settings.followup_alerts_enabled,
+        "followup_alerts_email_configured": settings.email_config_error() is None,
+        "followup_alert_hour": settings.followup_alert_hour,
+        "followup_alert_minute": settings.followup_alert_minute,
     }
 
 

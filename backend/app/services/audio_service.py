@@ -1,325 +1,195 @@
-"""Audio ingestion: validate, store and describe call recordings.
+"""Call recordings: fetch from the CRM, cache on disk, serve to the browser.
 
-This module knows about files, URLs, MIME types and ffprobe. It knows nothing
-about transcription or analysis -- it hands back an `AudioSource` and stops.
+There is no upload path any more -- every recording lives in the Lead Call API
+and is fetched with the `X-API-Key` header. That header is the whole reason this
+module exists rather than the browser pointing an <audio> tag upstream:
+
+  * A browser cannot attach `X-API-Key` to an <audio src>, so redirecting to the
+    CRM yields 401. Measured, not theoretical.
+  * Upstream sends no `content-length` and ignores `Range`, so a streamed
+    passthrough gives the player no duration and no seeking.
+
+So the first request buffers the whole body to disk and every request after that
+is served from the cache with proper headers. Recordings are immutable, so the
+cache never expires.
+
+Cached filenames derive from our own `call_id`, never from anything upstream,
+and `resolve_cached_path` refuses any path outside the cache directory.
 """
 
-import ipaddress
-import json
+from __future__ import annotations
+
 import logging
 import re
-import shutil
-import socket
-import subprocess
-import uuid
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
-
-import httpx
-from fastapi import UploadFile
 
 from app.config import settings
+from app.services.lead_call_client import (
+    LeadCallAPIError,
+    LeadCallUnavailable,
+    get_lead_call_client,
+)
 
 logger = logging.getLogger(__name__)
 
+AUDIO_MIME = "audio/mpeg"
+CACHE_SUFFIX = ".mp3"
+# A recording that comes back implausibly small is an error page, not audio.
+MIN_PLAUSIBLE_BYTES = 512
+# Upstream sends no content-length, so cap what we are willing to buffer.
+MAX_RECORDING_BYTES = 64 * 1024 * 1024
+
+# call_id is ours and always matches this, but assert it before it reaches a path.
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+
 
 class AudioValidationError(ValueError):
-    """Raised for anything the caller can fix: bad type, too large, bad URL."""
+    """Raised for an audio request we refuse. Mapped to 422 in main.py."""
 
 
-# Extension -> canonical MIME type. Browsers and servers disagree on audio
-# MIME types constantly, so the extension is the primary signal and the MIME
-# is a sanity check, not the other way round.
-MIME_BY_EXTENSION = {
-    "mp3": "audio/mpeg",
-    "wav": "audio/wav",
-    "m4a": "audio/mp4",
-    "ogg": "audio/ogg",
-    "webm": "audio/webm",
-}
-
-ACCEPTED_MIME_PREFIXES = (
-    "audio/", "video/webm", "video/mp4", "video/ogg", "application/ogg",
-    "application/octet-stream", "binary/octet-stream",
-)
-# Content types that mean "this is a web page, not a file" -- a 404 or login
-# page served with HTTP 200, which many hosts do.
-REJECTED_MIME_PREFIXES = ("text/html", "text/plain", "application/json", "application/xml")
-
-_SAFE_ID = re.compile(r"[^A-Za-z0-9_.-]")
+class RecordingNotAvailable(LookupError):
+    """This call has no recording to serve. Mapped to 404."""
 
 
 @dataclass
-class AudioSource:
-    """Where the audio lives, as the rest of the pipeline sees it."""
-
-    source_type: str          # "UPLOAD" | "URL"
-    file_path: str | None     # local path when stored locally
-    url: str | None           # remote URL for URL-mode calls
-    mime_type: str
-    size_bytes: int | None
-    filename: str | None
-    duration_seconds: int | None
+class CachedRecording:
+    path: Path
+    size_bytes: int
+    from_cache: bool
 
 
 # --------------------------------------------------------------------------
-# Shared validation
+# Paths
 # --------------------------------------------------------------------------
 
-
-def extension_of(name: str | None) -> str:
-    if not name or "." not in name:
-        return ""
-    return name.rsplit(".", 1)[-1].lower().strip()
-
-
-def validate_extension(name: str | None) -> str:
-    ext = extension_of(name)
-    allowed = settings.allowed_audio_extensions
-    if ext not in allowed:
-        raise AudioValidationError(
-            f"Unsupported audio type '.{ext or '?'}'. Allowed: {', '.join('.' + a for a in allowed)}."
-        )
-    return ext
+def cache_dir() -> Path:
+    path = settings.upload_path
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def validate_size(size_bytes: int | None) -> None:
-    if size_bytes is None:
-        return
-    if size_bytes <= 0:
-        raise AudioValidationError("The audio file is empty.")
-    if size_bytes > settings.max_audio_bytes:
-        raise AudioValidationError(
-            f"Audio is {size_bytes / (1024 * 1024):.1f} MB; the maximum is {settings.max_audio_mb} MB."
-        )
+def cached_path_for(call_id: str) -> Path:
+    """Where a call's audio is cached. Derived from call_id, never from upstream."""
+    if not call_id or not _SAFE_ID.match(call_id):
+        raise AudioValidationError(f"Unsafe call id: {call_id!r}")
+    return cache_dir() / f"{call_id}{CACHE_SUFFIX}"
 
 
-def _mime_looks_like_audio(mime: str | None, *, extension_ok: bool = False) -> bool:
-    """Servers and browsers disagree wildly on audio MIME types, so when the
-    extension is already on the allowlist only an obvious web page is refused."""
-    if not mime:
-        return True  # absent is tolerated; the extension already passed
-    mime = mime.split(";")[0].strip().lower()
-    if mime.startswith(REJECTED_MIME_PREFIXES):
-        return False
-    if extension_ok:
-        return True
-    return mime.startswith(ACCEPTED_MIME_PREFIXES)
-
-
-# --------------------------------------------------------------------------
-# Upload path
-# --------------------------------------------------------------------------
-
-
-def store_upload(upload: UploadFile, call_id: str) -> AudioSource:
-    """Validate an uploaded file and write it to the configured upload dir.
-
-    The stored filename is derived from call_id, never from the client's
-    filename, so a hostile name can't escape the upload directory.
-    """
-    ext = validate_extension(upload.filename)
-    if not _mime_looks_like_audio(upload.content_type, extension_ok=True):
-        raise AudioValidationError(
-            f"File '{upload.filename}' has content type '{upload.content_type}', which is not audio."
-        )
-
-    upload_dir = settings.upload_path
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    safe_id = _SAFE_ID.sub("_", call_id)
-    target = upload_dir / f"{safe_id}.{ext}"
-
-    # Stream to disk while counting bytes; abort past the cap rather than
-    # buffering an oversized upload in memory first.
-    written = 0
-    limit = settings.max_audio_bytes
-    with target.open("wb") as out:
-        while chunk := upload.file.read(1024 * 1024):
-            written += len(chunk)
-            if written > limit:
-                out.close()
-                target.unlink(missing_ok=True)
-                raise AudioValidationError(
-                    f"Audio exceeds the maximum of {settings.max_audio_mb} MB."
-                )
-            out.write(chunk)
-    if written == 0:
-        target.unlink(missing_ok=True)
-        raise AudioValidationError("The audio file is empty.")
-
-    return AudioSource(
-        source_type="UPLOAD",
-        file_path=str(target),
-        url=None,
-        mime_type=MIME_BY_EXTENSION.get(ext, upload.content_type or "audio/mpeg"),
-        size_bytes=written,
-        filename=upload.filename,
-        duration_seconds=probe_duration(target),
-    )
-
-
-def delete_stored_file(path: str | None) -> None:
-    if not path:
-        return
+def resolve_cached_path(call_id: str) -> Path | None:
+    """The cached file for a call, or None. Refuses anything outside the cache dir."""
+    path = cached_path_for(call_id)
     try:
-        Path(path).unlink(missing_ok=True)
-    except OSError:  # pragma: no cover - best effort cleanup
-        logger.warning("Could not remove %s", path)
+        resolved = path.resolve()
+        root = cache_dir().resolve()
+    except OSError:
+        return None
+    if root not in resolved.parents:
+        logger.warning("Refusing audio path outside the cache directory: %s", resolved)
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def delete_cached_file(call_id: str) -> None:
+    try:
+        path = resolve_cached_path(call_id)
+        if path:
+            path.unlink()
+    except (OSError, AudioValidationError):  # pragma: no cover - best effort
+        logger.debug("Could not delete cached audio for %s", call_id, exc_info=True)
 
 
 # --------------------------------------------------------------------------
-# URL path
+# Fetching
 # --------------------------------------------------------------------------
 
+def fetch_recording(call_id: str, crm_call_id: str | None) -> CachedRecording:
+    """Return the cached audio for a call, fetching it from the CRM if needed.
 
-def _assert_public_host(hostname: str) -> None:
-    """Refuse URLs that resolve to loopback / private / link-local addresses.
-
-    The backend fetches this URL server-side, so without this check a user
-    could point it at the Mongo port or cloud metadata endpoint.
+    Raises:
+        RecordingNotAvailable -- no crm_call_id, or the CRM has no recording.
+        LeadCallAPIError      -- the key is missing/invalid (operator must fix).
+        LeadCallUnavailable   -- the CRM or its telephony provider was unreachable.
     """
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror as exc:
-        raise AudioValidationError(f"Could not resolve host '{hostname}'.") from exc
-    for info in infos:
-        address = ipaddress.ip_address(info[4][0])
-        if (
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_reserved
-            or address.is_multicast
-            or address.is_unspecified
-        ):
-            raise AudioValidationError(
-                f"URL host '{hostname}' resolves to a non-public address and cannot be fetched."
-            )
+    existing = resolve_cached_path(call_id)
+    if existing:
+        return CachedRecording(path=existing, size_bytes=existing.stat().st_size, from_cache=True)
 
-
-def validate_audio_url(url: str) -> dict:
-    """Check a URL is well-formed, public and serves an audio file of acceptable size.
-
-    Returns metadata for the UI (content type, size, filename) without
-    downloading the body.
-    """
-    url = (url or "").strip()
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise AudioValidationError("Audio URL must start with http:// or https://.")
-    if not parsed.netloc:
-        raise AudioValidationError("Audio URL is missing a host.")
-    if parsed.username or parsed.password:
-        raise AudioValidationError("Audio URL must not embed credentials.")
-
-    _assert_public_host(parsed.hostname or "")
-
-    filename = Path(parsed.path).name or None
-    ext = extension_of(filename)
-
-    try:
-        with httpx.Client(follow_redirects=True, timeout=10.0) as client:
-            response = client.head(url, headers={"User-Agent": "lead-followup/1.0"})
-            if response.status_code == 405 or response.status_code >= 400:
-                # Some hosts refuse HEAD; ask for the first byte instead.
-                response = client.get(
-                    url, headers={"Range": "bytes=0-0", "User-Agent": "lead-followup/1.0"}
-                )
-    except httpx.HTTPError as exc:
-        raise AudioValidationError(f"Audio URL is not reachable: {exc.__class__.__name__}.") from exc
-
-    if response.status_code >= 400:
-        raise AudioValidationError(f"Audio URL returned HTTP {response.status_code}.")
-
-    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-    if ext:
-        validate_extension(filename)
-    elif not content_type.startswith("audio/"):
-        raise AudioValidationError(
-            "Could not confirm the URL points at audio: no audio file extension and "
-            f"Content-Type is '{content_type or 'unknown'}'."
-        )
-    if content_type and not _mime_looks_like_audio(content_type, extension_ok=bool(ext)):
-        raise AudioValidationError(
-            f"URL returned Content-Type '{content_type}', which is a web page rather than audio."
+    if not crm_call_id:
+        raise RecordingNotAvailable(
+            "This call has no recording stored in the CRM."
         )
 
-    size = None
-    length = response.headers.get("content-length")
-    content_range = response.headers.get("content-range")
-    if content_range and "/" in content_range:
-        length = content_range.rsplit("/", 1)[-1]
-    if length and length.isdigit():
-        size = int(length)
-        validate_size(size)
+    client = get_lead_call_client()  # raises LeadCallAPIError when unconfigured
 
-    return {
-        "url": str(response.url),
-        "content_type": content_type or MIME_BY_EXTENSION.get(ext, "audio/mpeg"),
-        "size_bytes": size,
-        "filename": filename,
-        "reachable": True,
-    }
-
-
-def source_from_url(url: str, meta: dict) -> AudioSource:
-    return AudioSource(
-        source_type="URL",
-        file_path=None,
-        url=meta.get("url") or url,
-        mime_type=meta.get("content_type") or "audio/mpeg",
-        size_bytes=meta.get("size_bytes"),
-        filename=meta.get("filename"),
-        duration_seconds=None,  # unknown until transcribed
-    )
-
-
-def download_url_to_temp(url: str) -> tuple[bytes, str]:
-    """Fetch a validated URL's body for transcription. Enforces the size cap."""
-    with httpx.Client(follow_redirects=True, timeout=60.0) as client:
-        with client.stream("GET", url, headers={"User-Agent": "lead-followup/1.0"}) as response:
-            response.raise_for_status()
-            mime = (response.headers.get("content-type") or "audio/mpeg").split(";")[0].strip()
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_bytes():
+    target = cached_path_for(call_id)
+    # Write to a temp name first so an interrupted fetch cannot leave a
+    # truncated file that later reads would happily serve as a complete one.
+    partial = target.with_suffix(f".{secrets.token_hex(4)}.partial")
+    total = 0
+    try:
+        with partial.open("wb") as handle:
+            for chunk in client.stream_recording(crm_call_id):
                 total += len(chunk)
-                if total > settings.max_audio_bytes:
+                if total > MAX_RECORDING_BYTES:
                     raise AudioValidationError(
-                        f"Remote audio exceeds the maximum of {settings.max_audio_mb} MB."
+                        "The recording exceeded the maximum size this server will buffer."
                     )
-                chunks.append(chunk)
-    return b"".join(chunks), mime
+                handle.write(chunk)
+    except LeadCallAPIError as exc:
+        partial.unlink(missing_ok=True)
+        if exc.is_skippable:
+            raise RecordingNotAvailable(
+                "The CRM has no recording for this call."
+            ) from exc
+        raise
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
 
-
-# --------------------------------------------------------------------------
-# Metadata
-# --------------------------------------------------------------------------
-
-
-def probe_duration(path: Path | str) -> int | None:
-    """Return the duration in whole seconds via ffprobe, or None if unavailable."""
-    if shutil.which("ffprobe") is None:
-        return None
-    try:
-        completed = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "json", str(path),
-            ],
-            capture_output=True, text=True, timeout=20, check=False,
+    if total < MIN_PLAUSIBLE_BYTES:
+        partial.unlink(missing_ok=True)
+        raise RecordingNotAvailable(
+            "The CRM returned an empty recording for this call."
         )
-        data = json.loads(completed.stdout or "{}")
-        duration = float(data.get("format", {}).get("duration", 0))
-        return int(round(duration)) if duration > 0 else None
-    except (subprocess.SubprocessError, ValueError, json.JSONDecodeError):
-        return None
 
+    partial.replace(target)
+    logger.info("Cached recording for %s (%s bytes) from CRM call %s", call_id, total, crm_call_id)
+    return CachedRecording(path=target, size_bytes=total, from_cache=False)
+
+
+def load_audio_bytes(call_id: str, crm_call_id: str | None) -> bytes:
+    """The raw audio for a call, for transcription. Goes through the same cache."""
+    return fetch_recording(call_id, crm_call_id).path.read_bytes()
+
+
+# --------------------------------------------------------------------------
+# Ids
+# --------------------------------------------------------------------------
 
 def new_call_id() -> str:
-    return f"CALL-{uuid.uuid4().hex[:8].upper()}"
+    return f"CALL-{secrets.token_hex(4).upper()}"
 
 
 def new_id(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
+    return f"{prefix}-{secrets.token_hex(4).upper()}"
+
+
+__all__ = [
+    "AUDIO_MIME",
+    "AudioValidationError",
+    "CachedRecording",
+    "LeadCallUnavailable",
+    "RecordingNotAvailable",
+    "cache_dir",
+    "cached_path_for",
+    "delete_cached_file",
+    "fetch_recording",
+    "load_audio_bytes",
+    "new_call_id",
+    "new_id",
+    "resolve_cached_path",
+]

@@ -4,9 +4,11 @@ Nothing here has a hardcoded MongoDB URL or a hardcoded credential -- if a
 required value is missing the app refuses to start with a clear message rather
 than silently using a default.
 
-Vertex AI settings are validated lazily (see `vertex_config_error`) because the
-app must still boot, serve the dashboard and seed data when Google Cloud has
-not been configured yet. Only the AI-dependent routes fail in that case.
+Vertex AI and Lead Call API settings are validated lazily (see
+`vertex_config_error` / `lead_call_config_error`) because the app must still
+boot, serve the dashboard and seed data when neither has been configured yet.
+Only the routes that actually need them fail in that case -- an unset CRM key
+degrades audio playback and nothing else.
 """
 
 import json
@@ -30,6 +32,12 @@ class Settings(BaseSettings):
     # ---- MongoDB (required) ------------------------------------------------
     mongodb_url: str = Field(..., alias="MONGODB_URL")
     database_name: str = Field(..., alias="DATABASE_NAME")
+    # How long to wait for a usable server before giving up. A local mongod
+    # answers in milliseconds, but a remote replica set (Atlas) needs a TLS
+    # handshake to several hosts and measurably takes 6-12s from some
+    # networks -- the old hardcoded 5s sat just under that and failed startup
+    # every time. Raise it further on a slow link.
+    mongodb_timeout_ms: int = Field(15000, alias="MONGODB_TIMEOUT_MS", ge=1000, le=120000)
 
     # ---- Vertex AI / Gemini ------------------------------------------------
     # Blank until the operator configures Google Cloud. `vertex_config_error`
@@ -54,18 +62,14 @@ class Settings(BaseSettings):
     call_analysis_api_key: str = Field("", alias="CALL_ANALYSIS_API_KEY")
     call_analysis_model: str = Field("global.anthropic.claude-sonnet-5", alias="CALL_ANALYSIS_MODEL")
 
-    # ---- Feature gate --------------------------------------------------------
-    # The entire "Analyze New Call" section (UI) and its ingestion/processing
-    # endpoints are hidden/disabled unless this is explicitly set to true.
-    # Default false: "only if the variable in the env is specified".
-    call_analyzer_enabled: bool = Field(False, alias="CALL_ANALYZER_ENABLED")
-
-    # Each "Analyze New Call" input mode can be independently shown/hidden.
-    # Default true for all three so existing setups keep working unchanged;
-    # set any to false to hide that tab from the UI and reject its endpoint.
-    call_analyzer_upload_enabled: bool = Field(True, alias="CALL_ANALYZER_UPLOAD_ENABLED")
-    call_analyzer_url_enabled: bool = Field(True, alias="CALL_ANALYZER_URL_ENABLED")
-    call_analyzer_text_enabled: bool = Field(True, alias="CALL_ANALYZER_TEXT_ENABLED")
+    # ---- Lead Call API (the CRM) -------------------------------------------
+    # Upstream source of leads, calls, transcripts and recordings. The key is a
+    # bearer credential to real customer conversations: it lives in backend/.env
+    # only and must never reach UIConfig / GET /api/config.
+    lead_call_api_url: str = Field(
+        "https://lead-call-api.codingpuppet.com", alias="LEAD_CALL_API_URL"
+    )
+    lead_call_api_key: str = Field("", alias="LEAD_CALL_API_KEY")
 
     # ---- Pipeline ----------------------------------------------------------
     transcription_provider: str = Field("vertex", alias="TRANSCRIPTION_PROVIDER")
@@ -74,11 +78,11 @@ class Settings(BaseSettings):
     analysis_fallback_enabled: bool = Field(True, alias="ANALYSIS_FALLBACK_ENABLED")
 
     # ---- Audio -------------------------------------------------------------
-    audio_storage_mode: str = Field("local", alias="AUDIO_STORAGE_MODE")
+    # There is no upload path any more; recordings are proxied from the CRM and
+    # cached under audio_cache_dir. Recordings are immutable, so the cache never
+    # expires.
     audio_playback_enabled: bool = Field(True, alias="AUDIO_PLAYBACK_ENABLED")
-    audio_upload_dir: str = Field("uploads", alias="AUDIO_UPLOAD_DIR")
-    max_audio_mb: int = Field(20, alias="MAX_AUDIO_MB", ge=1, le=100)
-    allowed_audio_types: str = Field("mp3,wav,m4a,ogg,webm", alias="ALLOWED_AUDIO_TYPES")
+    audio_cache_dir: str = Field("uploads", alias="AUDIO_CACHE_DIR")
 
     cors_origins: str = Field("http://localhost:5173", alias="CORS_ORIGINS")
 
@@ -102,14 +106,6 @@ class Settings(BaseSettings):
             raise ValueError("must not be empty")
         return value.strip()
 
-    @field_validator("audio_storage_mode")
-    @classmethod
-    def _valid_storage_mode(cls, value: str) -> str:
-        mode = (value or "local").strip().lower()
-        if mode not in {"local", "url"}:
-            raise ValueError("AUDIO_STORAGE_MODE must be 'local' or 'url'")
-        return mode
-
     @model_validator(mode="after")
     def _materialize_credentials_json(self) -> "Settings":
         if self.google_credentials_json.strip() and not self.google_application_credentials.strip():
@@ -124,21 +120,9 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     @property
-    def allowed_audio_extensions(self) -> list[str]:
-        return [
-            ext.strip().lower().lstrip(".")
-            for ext in self.allowed_audio_types.split(",")
-            if ext.strip()
-        ]
-
-    @property
-    def max_audio_bytes(self) -> int:
-        return self.max_audio_mb * 1024 * 1024
-
-    @property
     def upload_path(self) -> Path:
-        """Absolute upload directory, resolved relative to backend/ when needed."""
-        path = Path(self.audio_upload_dir)
+        """Absolute audio cache directory, resolved relative to backend/ when needed."""
+        path = Path(self.audio_cache_dir)
         return path if path.is_absolute() else BACKEND_DIR / path
 
     @property
@@ -166,6 +150,22 @@ class Settings(BaseSettings):
             return (
                 f"GOOGLE_APPLICATION_CREDENTIALS points to '{creds}', which does not exist. "
                 "Fix the path, or leave it blank to use Application Default Credentials."
+            )
+        return None
+
+    def lead_call_config_error(self) -> str | None:
+        """Return a readable reason the Lead Call API cannot be used, or None.
+
+        Checked at call time, never at startup: the dashboard, worklist,
+        insights and every seeded record must keep working on a machine with no
+        CRM key. Only audio playback depends on this.
+        """
+        if not self.lead_call_api_url.strip():
+            return "LEAD_CALL_API_URL is not set in backend/.env."
+        if not self.lead_call_api_key.strip():
+            return (
+                "LEAD_CALL_API_KEY is not set in backend/.env. Set it to a Lead Call API key "
+                "(it looks like lca_...) to enable call recording playback."
             )
         return None
 

@@ -10,7 +10,7 @@
 gcp-*.json
 credentials.json
 
-# Uploaded call recordings
+# Cached CRM call recordings (refetched on demand; never source)
 backend/uploads/*
 !backend/uploads/.gitkeep
 

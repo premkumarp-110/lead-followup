@@ -43,11 +43,125 @@ class AnalysisStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class SentimentLabel(str, Enum):
+    """How the *customer* sounded, overall.
+
+    UNKNOWN is a real answer, not a failure: a 12-second call or a transcript
+    that is mostly crosstalk genuinely cannot be judged, and the deterministic
+    fallback never judges tone at all.
+    """
+
+    POSITIVE = "POSITIVE"
+    NEUTRAL = "NEUTRAL"
+    NEGATIVE = "NEGATIVE"
+    MIXED = "MIXED"
+    UNKNOWN = "UNKNOWN"
+
+
+class SentimentTrajectory(str, Enum):
+    """Whether the customer warmed up or cooled off across the call.
+
+    This is the part a single averaged label cannot express, and it is the
+    earliest signal that a lead is about to drop: a call that ended worse than
+    it started is a different prospect from one that ended better, even when
+    both average out to NEUTRAL.
+    """
+
+    IMPROVED = "IMPROVED"
+    STABLE = "STABLE"
+    DECLINED = "DECLINED"
+    UNKNOWN = "UNKNOWN"
+
+
 def _blank_to_none(value):
     """LLMs write 'null', 'N/A' and '' where they mean absent."""
     if isinstance(value, str) and value.strip().lower() in {"", "null", "none", "n/a", "-"}:
         return None
     return value
+
+
+# A model that means "-0.45" sometimes writes "-45", i.e. a percentage. One that
+# means "as negative as it gets" sometimes writes "-2.5", i.e. it overshot the
+# scale. Rescaling both would turn the second into -0.025 -- near neutral, the
+# opposite of what was meant. So only values big enough to be unambiguously a
+# percentage are divided; small overshoots clamp instead.
+SENTIMENT_PERCENTAGE_THRESHOLD = 10.0
+
+
+class CallSentiment(BaseModel):
+    """The customer's sentiment on one call.
+
+    The CRM supplies nothing like this -- its own analysis carries a pitch
+    score, a win probability and violations, all of which rate the *agent*.
+    This rates the lead, which is what decides whether a follow-up is worth
+    scheduling.
+
+    Deliberately NOT forced to agree with `outcome`. A polite, warm decline is
+    genuinely POSITIVE tone with a DROPPED outcome, and a curt "yes fine, send
+    it" is NEGATIVE tone that still converts. Making them consistent would
+    destroy exactly the signal this field adds.
+    """
+
+    label: SentimentLabel = SentimentLabel.UNKNOWN
+    score: float | None = None            # -1.0 (hostile) .. +1.0 (enthusiastic)
+    trajectory: SentimentTrajectory = SentimentTrajectory.UNKNOWN
+    evidence: str | None = None           # a short verbatim quote from the transcript
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _lenient_label(cls, value):
+        """Normalise an unrecognised label to UNKNOWN instead of failing."""
+        value = _blank_to_none(value)
+        if value is None:
+            return SentimentLabel.UNKNOWN
+        if isinstance(value, SentimentLabel):
+            return value
+        try:
+            return SentimentLabel(str(value).strip().upper().replace(" ", "_"))
+        except ValueError:
+            return SentimentLabel.UNKNOWN
+
+    @field_validator("trajectory", mode="before")
+    @classmethod
+    def _lenient_trajectory(cls, value):
+        value = _blank_to_none(value)
+        if value is None:
+            return SentimentTrajectory.UNKNOWN
+        if isinstance(value, SentimentTrajectory):
+            return value
+        try:
+            return SentimentTrajectory(str(value).strip().upper().replace(" ", "_"))
+        except ValueError:
+            return SentimentTrajectory.UNKNOWN
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _coerce_score(cls, value):
+        """Accept "-0.45"; rescale -45 to -0.45; clamp -2.5 to -1.0."""
+        value = _blank_to_none(value)
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if abs(number) >= SENTIMENT_PERCENTAGE_THRESHOLD:
+            number = number / 100.0
+        return min(max(number, -1.0), 1.0)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _normalise_evidence(cls, value):
+        """A quote is for display; leading/trailing whitespace is noise."""
+        value = _blank_to_none(value)
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _unknown_has_no_score(self) -> "CallSentiment":
+        """Never report a number for something that was not assessed."""
+        if self.label is SentimentLabel.UNKNOWN:
+            self.score = None
+        return self
 
 
 class AnalysisFollowUp(BaseModel):
@@ -112,6 +226,9 @@ class CallAnalysisResult(BaseModel):
     summary: str = ""
     key_points: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Defaulted rather than required, so analyses stored before sentiment
+    # existed still validate when they are read back.
+    sentiment: CallSentiment = Field(default_factory=CallSentiment)
 
     @field_validator("customer_intent", mode="before")
     @classmethod
@@ -200,6 +317,9 @@ class CallAnalysis(BaseModel):
     summary: str | None = None
     key_points: list[str] = Field(default_factory=list)
     confidence: float | None = None
+    # None on documents written before sentiment existed, and on failed
+    # attempts, which have no result to copy from.
+    sentiment: CallSentiment | None = None
 
     # Kept for every attempt, successful or not, so a bad response can be
     # debugged after the fact (spec S13).
